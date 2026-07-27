@@ -1,0 +1,41 @@
+[package]
+name = "mintshot"
+version = "1.0.0"
+edition = "2021"
+authors = ["MintShot Team"]
+description = "Lightweight partial screenshot tool for Linux Mint"
+license = "MIT"
+
+[dependencies]
+# X11 bindings - lightweight, no heavy GUI framework
+x11 = { version = "2.21", features = ["xlib", "xfixes", "xrender", "xcursor"] }
+# Image encoding
+png = "0.17"
+# Cairo for drawing selection overlay
+cairo-rs = { version = "0.18", features = ["xcb", "png"] }
+# XCB for efficient X11 communication
+xcb = { version = "1.3", features = ["xfixes", "randr", "shm"] }
+# For clipboard
+arboard = "3.3"
+# For hotkey registration
+x11-dl = "2.21"
+# Time handling
+chrono = "0.4"
+# Home directory
+dirs = "5.0"
+# Signal handling
+signal-hook = "0.3"
+# Minimal logging
+log = "0.4"
+env_logger = "0.10"
+# Image manipulation (minimal features)
+image = { version = "0.24", default-features = false, features = ["png"] }
+# Nix for low-level Linux syscalls
+nix = { version = "0.27", features = ["signal"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
