@@ -1,12 +1,12 @@
 //! Main capture orchestration module
 //!
-//! 1. Capture full screen (fast XGetImage)
-//! 2. Show translucent overlay for region selection
-//! 3. Crop selected region
-//! 4. Save to file and clipboard
-//! 5. Show desktop notification
+//! 1. Show overlay for region selection
+//! 2. Capture selected region (XGetImage)
+//! 3. Save to PNG file
+//! 4. Auto-copy to clipboard (ready to paste immediately)
+//! 5. Desktop notification with result
 
-use log::info;
+use log::{info, warn};
 use std::error::Error;
 
 use crate::clipboard;
@@ -49,20 +49,27 @@ pub fn take_partial_screenshot() -> Result<String, Box<dyn Error>> {
     // Step 3: Capture the selected region
     let pixels = capture_region(display, root, &selection)?;
 
-    // Step 4: Close display
+    // Step 4: Close X display — done with screen access
     unsafe { x11::xlib::XCloseDisplay(display); }
 
-    // Step 5: Save PNG
+    // Step 5: Save PNG file
     let filepath = save::save_png(&pixels, selection.width, selection.height)?;
+    info!("Saved: {}", filepath);
 
-    // Step 6: Copy to clipboard
-    match clipboard::copy_to_clipboard(&filepath) {
-        Ok(())  => info!("Screenshot copied to clipboard"),
-        Err(e)  => info!("Clipboard copy failed (non-fatal): {}", e),
-    }
+    // Step 6: Auto-copy to clipboard (immediately ready to Ctrl+V)
+    let clipboard_ok = match clipboard::copy_to_clipboard(&filepath) {
+        Ok(()) => {
+            info!("Screenshot copied to clipboard — ready to paste!");
+            true
+        }
+        Err(e) => {
+            warn!("Clipboard copy failed: {} (screenshot still saved to file)", e);
+            false
+        }
+    };
 
     // Step 7: Desktop notification
-    send_notification(&filepath, selection.width, selection.height);
+    send_notification(&filepath, &selection, clipboard_ok);
 
     Ok(filepath)
 }
@@ -71,13 +78,13 @@ pub fn take_partial_screenshot() -> Result<String, Box<dyn Error>> {
 fn capture_region(
     display: *mut x11::xlib::Display,
     root: x11::xlib::Window,
-    selection: &SelectionRect,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    sel: &SelectionRect,
+) -> Result<Vec<u8>, Box<dyn Error>> {
     unsafe {
         let image = x11::xlib::XGetImage(
             display, root,
-            selection.x as i32, selection.y as i32,
-            selection.width, selection.height,
+            sel.x as i32, sel.y as i32,
+            sel.width, sel.height,
             x11::xlib::XAllPlanes(),
             x11::xlib::ZPixmap,
         );
@@ -86,23 +93,22 @@ fn capture_region(
             return Err("XGetImage failed".into());
         }
 
-        let img = &*image;
-        let total_pixels = (selection.width * selection.height) as usize;
-        let mut pixels = Vec::with_capacity(total_pixels * 4);
+        let img       = &*image;
+        let total_px  = (sel.width * sel.height) as usize;
+        let mut pixels = Vec::with_capacity(total_px * 4);
 
-        let data           = img.data as *const u8;
-        let bytes_per_line = img.bytes_per_line as usize;
-        let bpp            = (img.bits_per_pixel / 8) as usize;
+        let data = img.data as *const u8;
+        let bpl  = img.bytes_per_line as usize;
+        let bpp  = (img.bits_per_pixel / 8) as usize;
 
-        for y in 0..selection.height as usize {
-            let row = y * bytes_per_line;
-            for x in 0..selection.width as usize {
+        for y in 0..sel.height as usize {
+            let row = y * bpl;
+            for x in 0..sel.width as usize {
                 let off = row + x * bpp;
                 let b = *data.add(off);
                 let g = *data.add(off + 1);
                 let r = *data.add(off + 2);
                 let a = if bpp == 4 { *data.add(off + 3) } else { 255 };
-
                 pixels.push(r);
                 pixels.push(g);
                 pixels.push(b);
@@ -115,21 +121,27 @@ fn capture_region(
     }
 }
 
-/// Send a desktop notification about the saved screenshot
-fn send_notification(filepath: &str, width: u32, height: u32) {
-    let summary = "MintShot - Screenshot Saved";
+/// Send desktop notification with capture result
+fn send_notification(filepath: &str, sel: &SelectionRect, clipboard_ok: bool) {
+    let clipboard_status = if clipboard_ok {
+        "📋 Copied to clipboard — ready to paste!"
+    } else {
+        "⚠ Clipboard unavailable — file saved only"
+    };
+
     let body = format!(
-        "{}×{} px\n{}",
-        width, height, filepath
+        "{}×{} px\n{}\n{}",
+        sel.width, sel.height,
+        clipboard_status,
+        filepath,
     );
 
-    // Use notify-send (available on all Linux Mint installations)
     match std::process::Command::new("notify-send")
         .arg("--app-name=MintShot")
         .arg("--icon=accessories-screenshot")
         .arg("--urgency=low")
-        .arg("--expire-time=3000")
-        .arg(summary)
+        .arg("--expire-time=4000")
+        .arg("MintShot — Screenshot Captured! ✓")
         .arg(&body)
         .spawn()
     {
