@@ -21,36 +21,22 @@ use crate::selection::SelectionRect;
 
 // ─── Visual constants ─────────────────────────────────────────────────────────
 
-/// Selection border - bright green for maximum contrast on any background
 const SEL_BORDER_COLOR: u64  = 0x00_CC_66;
-/// Selection border outer glow (dark for contrast)
 const SEL_BORDER_SHADOW: u64 = 0x00_00_00;
-/// Corner handle color
 const CORNER_COLOR: u64      = 0xFF_FF_FF;
-/// Corner handle size (pixels)
 const CORNER_SIZE: i32       = 8;
-/// Selection border thickness
 const BORDER_WIDTH: u32      = 2;
-
-/// Crosshair guide color
 const GUIDE_COLOR: u64       = 0xFF_FF_FF;
-/// Edge guide color (lines from selection to screen edge)
 const EDGE_GUIDE_COLOR: u64  = 0x80_80_80;
-
-/// Info panel colors
 const PANEL_BG: u64          = 0x1A_1A_2E;
 const PANEL_TEXT: u64         = 0xFF_FF_FF;
 const PANEL_ACCENT: u64      = 0x00_CC_66;
 const PANEL_DIM_TEXT: u64    = 0xAA_AA_AA;
-
-/// Help bar colors
 const HELP_BG: u64           = 0x16_16_28;
 const HELP_TEXT: u64         = 0xCC_CC_CC;
 const HELP_KEY_BG: u64      = 0x33_33_55;
 const HELP_KEY_TEXT: u64     = 0xFF_FF_FF;
-
-/// X11 cursor constant (XC_crosshair = 34)
-const XC_CROSSHAIR: u32 = 34;
+const XC_CROSSHAIR: u32     = 34;
 
 // ─── Drag state ───────────────────────────────────────────────────────────────
 
@@ -83,14 +69,26 @@ struct CursorPos {
     y: i32,
 }
 
+// ─── Result from overlay ──────────────────────────────────────────────────────
+
+/// Contains both the selection rectangle AND the raw screen pixel data
+/// captured BEFORE the overlay was shown.
+pub struct CaptureResult {
+    pub selection: SelectionRect,
+    pub pixels: Vec<u8>,   // RGBA pixels of selected region
+}
+
 // ─── Public entry point ───────────────────────────────────────────────────────
 
+/// Show overlay, get selection, AND return cropped pixels from the
+/// pre-overlay screenshot. This guarantees clean pixels without
+/// any overlay artifacts.
 pub fn show_selection_overlay(
     display: *mut xlib::Display,
     root: xlib::Window,
     screen_width: u32,
     screen_height: u32,
-) -> Result<SelectionRect, Box<dyn Error>> {
+) -> Result<CaptureResult, Box<dyn Error>> {
     unsafe { run_overlay(display, root, screen_width, screen_height) }
 }
 
@@ -101,14 +99,17 @@ unsafe fn run_overlay(
     root: xlib::Window,
     sw: u32,
     sh: u32,
-) -> Result<SelectionRect, Box<dyn Error>> {
+) -> Result<CaptureResult, Box<dyn Error>> {
 
     let screen   = xlib::XDefaultScreen(display);
     let visual   = xlib::XDefaultVisual(display, screen);
     let depth    = xlib::XDefaultDepth(display, screen);
     let colormap = xlib::XDefaultColormap(display, screen);
 
-    // Capture screen before overlay appears
+    // ═══════════════════════════════════════════════════════════════════════
+    // CRITICAL: Capture the ENTIRE screen BEFORE creating the overlay.
+    // This is the CLEAN image we will crop from later.
+    // ═══════════════════════════════════════════════════════════════════════
     let bg = xlib::XGetImage(
         display, root, 0, 0, sw, sh,
         xlib::XAllPlanes(), xlib::ZPixmap,
@@ -117,7 +118,7 @@ unsafe fn run_overlay(
         return Err("Failed to capture background".into());
     }
 
-    // Create fullscreen overlay window
+    // Create overlay window
     let mut attrs: xlib::XSetWindowAttributes = std::mem::zeroed();
     attrs.override_redirect = xlib::True;
     attrs.event_mask        = xlib::ExposureMask
@@ -154,7 +155,7 @@ unsafe fn run_overlay(
     let gc  = xlib::XCreateGC(display, win, 0, ptr::null_mut());
     let buf = xlib::XCreatePixmap(display, win, sw, sh, depth as u32);
 
-    // Load a font for text rendering
+    // Load font
     let font_name = std::ffi::CString::new(
         "-*-fixed-bold-r-*-*-13-*-*-*-*-*-iso8859-1"
     ).unwrap();
@@ -168,11 +169,11 @@ unsafe fn run_overlay(
     blit(display, buf, win, gc, sw, sh);
     xlib::XFlush(display);
 
-    // ── Event loop ────────────────────────────────────────────────────────────
-    let mut event: xlib::XEvent          = std::mem::zeroed();
-    let mut drag                          = DragState::new();
-    let mut cursor: Option<CursorPos>     = None;
-    let mut result: Option<SelectionRect> = None;
+    // ── Event loop ────────────────────────────────────────────────────────
+    let mut event: xlib::XEvent              = std::mem::zeroed();
+    let mut drag                              = DragState::new();
+    let mut cursor: Option<CursorPos>         = None;
+    let mut result_sel: Option<SelectionRect> = None;
 
     'event_loop: loop {
         xlib::XNextEvent(display, &mut event);
@@ -219,9 +220,7 @@ unsafe fn run_overlay(
                 if btn.button == 1 && drag.active {
                     let sel = drag.to_selection(btn.x, btn.y);
                     if sel.is_valid() {
-                        // Flash feedback before closing
-                        flash_capture(display, buf, win, gc, bg, sw, sh, &sel);
-                        result = Some(sel);
+                        result_sel = Some(sel);
                     }
                     break 'event_loop;
                 }
@@ -239,7 +238,23 @@ unsafe fn run_overlay(
         }
     }
 
-    // ── Cleanup ───────────────────────────────────────────────────────────────
+    // Ensure X11 is fully synced before we read pixel data
+    xlib::XSync(display, xlib::False);
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Extract clean pixels from bg BEFORE destroying it.
+    // ══════════════════════════════════════════════════════════════════════
+    let result: Option<CaptureResult> = match result_sel {
+        Some(sel) => {
+            let pixels = extract_region_from_ximage(bg, &sel);
+            info!("Extracted {} bytes for {}x{} region",
+                  pixels.len(), sel.width, sel.height);
+            Some(CaptureResult { selection: sel, pixels })
+        }
+        None => None,
+    };
+
+    // ── Cleanup ───────────────────────────────────────────────────────────
     xlib::XUngrabPointer(display, xlib::CurrentTime);
     xlib::XUngrabKeyboard(display, xlib::CurrentTime);
     xlib::XFreeCursor(display, cursor_font);
@@ -250,43 +265,116 @@ unsafe fn run_overlay(
     xlib::XDestroyWindow(display, win);
     xlib::XFlush(display);
 
+    // Return the extracted result
     result.ok_or_else(|| "Selection cancelled".into())
 }
 
-// ─── Flash feedback ───────────────────────────────────────────────────────────
+// ─── Extract clean pixels from XImage ─────────────────────────────────────────
 
-/// Brief white flash inside the selected area to confirm capture
-unsafe fn flash_capture(
-    display: *mut xlib::Display,
-    buf: xlib::Pixmap,
-    win: xlib::Window,
-    gc: xlib::GC,
-    bg: *mut xlib::XImage,
-    sw: u32,
-    sh: u32,
+/// Crop a region from the pre-captured XImage and convert to RGBA.
+///
+/// Handles X11's various pixel formats:
+///   - 32-bit BGRA (most common on modern X11)
+///   - 32-bit BGRX (alpha byte is garbage/zero → force to 255)
+///   - 24-bit BGR
+///
+/// Uses the XImage's red/green/blue masks to correctly extract channels
+/// regardless of the display's byte order or pixel format.
+unsafe fn extract_region_from_ximage(
+    image: *mut xlib::XImage,
     sel: &SelectionRect,
-) {
-    // Frame 1: White flash over selection
-    full_redraw(display, buf, gc, bg, sw, sh, Some(sel), None);
-    xlib::XSetForeground(display, gc, 0xFF_FF_FF);
-    xlib::XFillRectangle(
-        display, buf, gc,
-        sel.x as i32, sel.y as i32, sel.width, sel.height,
-    );
-    blit(display, buf, win, gc, sw, sh);
-    xlib::XFlush(display);
-    std::thread::sleep(std::time::Duration::from_millis(80));
+) -> Vec<u8> {
+    let img = &*image;
+    let total_px = (sel.width * sel.height) as usize;
+    let mut pixels = Vec::with_capacity(total_px * 4);
 
-    // Frame 2: Restore normal selection view
-    full_redraw(display, buf, gc, bg, sw, sh, Some(sel), None);
-    blit(display, buf, win, gc, sw, sh);
-    xlib::XFlush(display);
-    std::thread::sleep(std::time::Duration::from_millis(80));
+    let data = img.data as *const u8;
+    let bytes_per_line = img.bytes_per_line as usize;
+    let bpp = (img.bits_per_pixel / 8) as usize;
+
+    // Get channel masks from XImage — these tell us where R/G/B bits are
+    let red_mask   = img.red_mask   as u32;
+    let green_mask = img.green_mask as u32;
+    let blue_mask  = img.blue_mask  as u32;
+
+    // Calculate bit shifts for each channel
+    let red_shift   = mask_shift(red_mask);
+    let green_shift = mask_shift(green_mask);
+    let blue_shift  = mask_shift(blue_mask);
+
+    log::info!(
+        "XImage format: bpp={}, R=0x{:08X} (shift {}), G=0x{:08X} (shift {}), B=0x{:08X} (shift {})",
+        img.bits_per_pixel, red_mask, red_shift,
+        green_mask, green_shift, blue_mask, blue_shift
+    );
+
+    // Clamp selection to image bounds
+    let img_w = img.width as u32;
+    let img_h = img.height as u32;
+    let sel_x = sel.x.min(img_w.saturating_sub(1));
+    let sel_y = sel.y.min(img_h.saturating_sub(1));
+    let sel_w = sel.width.min(img_w.saturating_sub(sel_x));
+    let sel_h = sel.height.min(img_h.saturating_sub(sel_y));
+
+    for y in 0..sel_h as usize {
+        let src_y = sel_y as usize + y;
+        let row = src_y * bytes_per_line;
+
+        for x in 0..sel_w as usize {
+            let src_x = sel_x as usize + x;
+            let off = row + src_x * bpp;
+
+            // Read pixel as u32 (little-endian on all common platforms)
+            let pixel: u32 = if bpp == 4 {
+                (*data.add(off) as u32)
+                    | ((*data.add(off + 1) as u32) << 8)
+                    | ((*data.add(off + 2) as u32) << 16)
+                    | ((*data.add(off + 3) as u32) << 24)
+            } else if bpp == 3 {
+                (*data.add(off) as u32)
+                    | ((*data.add(off + 1) as u32) << 8)
+                    | ((*data.add(off + 2) as u32) << 16)
+            } else {
+                // Fallback: read as much as we can
+                let mut p: u32 = 0;
+                for i in 0..bpp.min(4) {
+                    p |= (*data.add(off + i) as u32) << (i * 8);
+                }
+                p
+            };
+
+            // Extract channels using masks
+            let r = ((pixel & red_mask)   >> red_shift)   as u8;
+            let g = ((pixel & green_mask) >> green_shift) as u8;
+            let b = ((pixel & blue_mask)  >> blue_shift)  as u8;
+
+            // Always force alpha to 255 — root window has no alpha channel
+            pixels.push(r);
+            pixels.push(g);
+            pixels.push(b);
+            pixels.push(255);
+        }
+    }
+
+    pixels
+}
+
+/// Calculate the right-shift needed to move the mask's LSB to bit 0
+fn mask_shift(mask: u32) -> u32 {
+    if mask == 0 {
+        return 0;
+    }
+    let mut shift = 0u32;
+    let mut m = mask;
+    while m & 1 == 0 {
+        shift += 1;
+        m >>= 1;
+    }
+    shift
 }
 
 // ─── Full redraw ──────────────────────────────────────────────────────────────
 
-/// Complete buffer redraw: background → dim → selection/crosshair → UI panels
 unsafe fn full_redraw(
     display: *mut xlib::Display,
     buf: xlib::Pixmap,
@@ -297,13 +385,9 @@ unsafe fn full_redraw(
     selection: Option<&SelectionRect>,
     cursor: Option<&CursorPos>,
 ) {
-    // 1. Background screenshot
     xlib::XPutImage(display, buf, gc, bg, 0, 0, 0, 0, sw, sh);
-
-    // 2. Smooth dim overlay using double stipple (lighter ~30% dim)
     draw_dim_overlay(display, buf, gc, sw, sh);
 
-    // 3. Selection or crosshair
     match selection {
         Some(sel) if sel.is_valid() => {
             draw_selection(display, buf, gc, bg, sw, sh, sel, cursor);
@@ -316,13 +400,11 @@ unsafe fn full_redraw(
         }
     }
 
-    // 4. Help bar at top
     draw_help_bar(display, buf, gc, sw, selection.is_some());
 }
 
 // ─── Dim overlay ──────────────────────────────────────────────────────────────
 
-/// Draw a smooth semi-transparent dim using fine stipple pattern (~30% opacity)
 unsafe fn draw_dim_overlay(
     display: *mut xlib::Display,
     buf: xlib::Pixmap,
@@ -330,13 +412,11 @@ unsafe fn draw_dim_overlay(
     sw: u32,
     sh: u32,
 ) {
-    // Fine 4×4 stipple pattern — 4 out of 16 pixels black = ~25% dim
-    // This looks much smoother than the 2-byte checkerboard
     let stipple_data: [u8; 4] = [
-        0b1000_1000,  // row 0
-        0b0010_0010,  // row 1
-        0b1000_1000,  // row 2
-        0b0010_0010,  // row 3
+        0b1000_1000,
+        0b0010_0010,
+        0b1000_1000,
+        0b0010_0010,
     ];
 
     let stipple = xlib::XCreateBitmapFromData(
@@ -355,7 +435,6 @@ unsafe fn draw_dim_overlay(
 
 // ─── Selection drawing ───────────────────────────────────────────────────────
 
-/// Draw the selected region with clear content, border, corners, guides, and info
 unsafe fn draw_selection(
     display: *mut xlib::Display,
     buf: xlib::Pixmap,
@@ -369,26 +448,22 @@ unsafe fn draw_selection(
     let sx = sel.x as i32;
     let sy = sel.y as i32;
 
-    // ── Edge guide lines (from selection edges to screen edges) ────────────
+    // Edge guides
     xlib::XSetForeground(display, gc, EDGE_GUIDE_COLOR);
     xlib::XSetLineAttributes(display, gc, 1,
         xlib::LineOnOffDash, xlib::CapButt, xlib::JoinMiter);
 
-    // Top edge → screen top
     xlib::XDrawLine(display, buf, gc, sx, 0, sx, sy);
     xlib::XDrawLine(display, buf, gc, sx + sel.width as i32, 0,
                     sx + sel.width as i32, sy);
-    // Bottom edge → screen bottom
     xlib::XDrawLine(display, buf, gc, sx, sy + sel.height as i32,
                     sx, sh as i32);
     xlib::XDrawLine(display, buf, gc, sx + sel.width as i32,
                     sy + sel.height as i32,
                     sx + sel.width as i32, sh as i32);
-    // Left edge → screen left
     xlib::XDrawLine(display, buf, gc, 0, sy, sx, sy);
     xlib::XDrawLine(display, buf, gc, 0, sy + sel.height as i32,
                     sx, sy + sel.height as i32);
-    // Right edge → screen right
     xlib::XDrawLine(display, buf, gc, sx + sel.width as i32, sy,
                     sw as i32, sy);
     xlib::XDrawLine(display, buf, gc, sx + sel.width as i32,
@@ -398,52 +473,46 @@ unsafe fn draw_selection(
     xlib::XSetLineAttributes(display, gc, 1,
         xlib::LineSolid, xlib::CapButt, xlib::JoinMiter);
 
-    // ── Restore clear pixels inside selection ─────────────────────────────
+    // Restore clear pixels from pre-overlay capture
     xlib::XPutImage(
         display, buf, gc, bg,
         sx, sy, sx, sy, sel.width, sel.height,
     );
 
-    // ── Outer shadow border (dark) ────────────────────────────────────────
+    // Shadow border
     xlib::XSetForeground(display, gc, SEL_BORDER_SHADOW);
     xlib::XSetLineAttributes(display, gc, BORDER_WIDTH + 2,
         xlib::LineSolid, xlib::CapButt, xlib::JoinMiter);
     xlib::XDrawRectangle(display, buf, gc, sx, sy, sel.width, sel.height);
 
-    // ── Inner selection border (green) ────────────────────────────────────
+    // Green border
     xlib::XSetForeground(display, gc, SEL_BORDER_COLOR);
     xlib::XSetLineAttributes(display, gc, BORDER_WIDTH,
         xlib::LineSolid, xlib::CapButt, xlib::JoinMiter);
     xlib::XDrawRectangle(display, buf, gc, sx, sy, sel.width, sel.height);
 
-    // ── Corner handles ────────────────────────────────────────────────────
+    // Corner handles
     draw_corner_handles(display, buf, gc, sel);
 
-    // ── Crosshair at cursor during drag ───────────────────────────────────
+    // Crosshair inside selection during drag
     if let Some(c) = cursor {
         xlib::XSetForeground(display, gc, GUIDE_COLOR);
         xlib::XSetLineAttributes(display, gc, 1,
             xlib::LineOnOffDash, xlib::CapButt, xlib::JoinMiter);
-
-        // Only draw crosshair lines inside the selection area
-        // Horizontal through cursor
         xlib::XDrawLine(display, buf, gc, sx, c.y,
                         sx + sel.width as i32, c.y);
-        // Vertical through cursor
         xlib::XDrawLine(display, buf, gc, c.x, sy,
                         c.x, sy + sel.height as i32);
-
         xlib::XSetLineAttributes(display, gc, 1,
             xlib::LineSolid, xlib::CapButt, xlib::JoinMiter);
     }
 
-    // ── Info panel below selection ────────────────────────────────────────
+    // Info panel
     draw_info_panel(display, buf, gc, sel, sh);
 }
 
 // ─── Corner handles ──────────────────────────────────────────────────────────
 
-/// Draw small white squares at each corner of the selection
 unsafe fn draw_corner_handles(
     display: *mut xlib::Display,
     buf: xlib::Pixmap,
@@ -457,18 +526,16 @@ unsafe fn draw_corner_handles(
     let half = CORNER_SIZE / 2;
 
     let corners = [
-        (sx - half,  sy - half),   // top-left
-        (ex - half,  sy - half),   // top-right
-        (sx - half,  ey - half),   // bottom-left
-        (ex - half,  ey - half),   // bottom-right
-        // Midpoints
-        (sx + sel.width as i32 / 2 - half, sy - half),  // top-mid
-        (sx + sel.width as i32 / 2 - half, ey - half),  // bottom-mid
-        (sx - half, sy + sel.height as i32 / 2 - half), // left-mid
-        (ex - half, sy + sel.height as i32 / 2 - half), // right-mid
+        (sx - half, sy - half),
+        (ex - half, sy - half),
+        (sx - half, ey - half),
+        (ex - half, ey - half),
+        (sx + sel.width as i32 / 2 - half, sy - half),
+        (sx + sel.width as i32 / 2 - half, ey - half),
+        (sx - half, sy + sel.height as i32 / 2 - half),
+        (ex - half, sy + sel.height as i32 / 2 - half),
     ];
 
-    // Shadow behind handles
     xlib::XSetForeground(display, gc, SEL_BORDER_SHADOW);
     for (cx, cy) in &corners {
         xlib::XFillRectangle(display, buf, gc,
@@ -476,7 +543,6 @@ unsafe fn draw_corner_handles(
             (CORNER_SIZE + 2) as u32, (CORNER_SIZE + 2) as u32);
     }
 
-    // White handle fill
     xlib::XSetForeground(display, gc, CORNER_COLOR);
     for (cx, cy) in &corners {
         xlib::XFillRectangle(display, buf, gc,
@@ -485,9 +551,8 @@ unsafe fn draw_corner_handles(
     }
 }
 
-// ─── Crosshair guides (no selection) ─────────────────────────────────────────
+// ─── Crosshair guides ────────────────────────────────────────────────────────
 
-/// Full-screen dashed crosshair at cursor position (before drag starts)
 unsafe fn draw_crosshair_guides(
     display: *mut xlib::Display,
     buf: xlib::Pixmap,
@@ -499,17 +564,14 @@ unsafe fn draw_crosshair_guides(
     xlib::XSetForeground(display, gc, GUIDE_COLOR);
     xlib::XSetLineAttributes(display, gc, 1,
         xlib::LineOnOffDash, xlib::CapButt, xlib::JoinMiter);
-
     xlib::XDrawLine(display, buf, gc, 0, c.y, sw as i32, c.y);
     xlib::XDrawLine(display, buf, gc, c.x, 0, c.x, sh as i32);
-
     xlib::XSetLineAttributes(display, gc, 1,
         xlib::LineSolid, xlib::CapButt, xlib::JoinMiter);
 }
 
 // ─── Coordinate tooltip ──────────────────────────────────────────────────────
 
-/// Show mouse coordinates in a small tooltip near the cursor
 unsafe fn draw_coord_tooltip(
     display: *mut xlib::Display,
     buf: xlib::Pixmap,
@@ -522,29 +584,15 @@ unsafe fn draw_coord_tooltip(
     let c_text = std::ffi::CString::new(text.as_str()).unwrap();
     let text_w = (text.len() as i32) * 7 + 12;
     let text_h: i32 = 20;
-
-    // Position: prefer bottom-right of cursor, but flip if near edges
     let pad = 15;
-    let tx = if c.x + pad + text_w < sw as i32 {
-        c.x + pad
-    } else {
-        c.x - pad - text_w
-    };
-    let ty = if c.y + pad + text_h < sh as i32 {
-        c.y + pad
-    } else {
-        c.y - pad - text_h
-    };
 
-    // Dark rounded-ish background
+    let tx = if c.x + pad + text_w < sw as i32 { c.x + pad } else { c.x - pad - text_w };
+    let ty = if c.y + pad + text_h < sh as i32 { c.y + pad } else { c.y - pad - text_h };
+
     xlib::XSetForeground(display, gc, PANEL_BG);
     xlib::XFillRectangle(display, buf, gc, tx, ty, text_w as u32, text_h as u32);
-
-    // Subtle border
     xlib::XSetForeground(display, gc, 0x33_33_55);
     xlib::XDrawRectangle(display, buf, gc, tx, ty, text_w as u32, text_h as u32);
-
-    // Coordinate text
     xlib::XSetForeground(display, gc, PANEL_DIM_TEXT);
     xlib::XDrawString(display, buf, gc, tx + 6, ty + 14,
                       c_text.as_ptr(), text.len() as i32);
@@ -552,7 +600,6 @@ unsafe fn draw_coord_tooltip(
 
 // ─── Info panel ──────────────────────────────────────────────────────────────
 
-/// Detailed info panel below (or above) the selection showing dimensions and position
 unsafe fn draw_info_panel(
     display: *mut xlib::Display,
     buf: xlib::Pixmap,
@@ -564,9 +611,8 @@ unsafe fn draw_info_panel(
     let panel_h: u32 = 52;
     let margin: i32  = 8;
 
-    // Position: below selection, centered. Flip above if too close to bottom.
-    let px = (sel.x as i32 + sel.width as i32 / 2) - panel_w as i32 / 2;
-    let px = px.max(margin).min((sh as i32) - panel_w as i32 - margin); // clamp to screen
+    let px = ((sel.x as i32 + sel.width as i32 / 2) - panel_w as i32 / 2)
+        .max(margin);
 
     let py = if sel.y + sel.height + panel_h + 12 < sh {
         (sel.y + sel.height) as i32 + 10
@@ -574,34 +620,26 @@ unsafe fn draw_info_panel(
         sel.y as i32 - panel_h as i32 - 10
     };
 
-    // ── Panel background ──────────────────────────────────────────────────
     xlib::XSetForeground(display, gc, PANEL_BG);
     xlib::XFillRectangle(display, buf, gc, px, py, panel_w, panel_h);
-
-    // Border
     xlib::XSetForeground(display, gc, 0x33_33_55);
     xlib::XDrawRectangle(display, buf, gc, px, py, panel_w, panel_h);
 
-    // ── Line 1: Dimensions with accent color ──────────────────────────────
     let line1 = format!(" {}  x  {} px", sel.width, sel.height);
     let c_line1 = std::ffi::CString::new(line1.as_str()).unwrap();
 
-    // Size icon placeholder (small filled rect as icon)
     xlib::XSetForeground(display, gc, PANEL_ACCENT);
     xlib::XFillRectangle(display, buf, gc, px + 10, py + 8, 12, 12);
     xlib::XSetForeground(display, gc, PANEL_BG);
     xlib::XFillRectangle(display, buf, gc, px + 13, py + 11, 6, 6);
 
-    // Dimension text
     xlib::XSetForeground(display, gc, PANEL_TEXT);
     xlib::XDrawString(display, buf, gc, px + 26, py + 18,
                       c_line1.as_ptr(), line1.len() as i32);
 
-    // ── Line 2: Position ──────────────────────────────────────────────────
     let line2 = format!(" Position: ({}, {})", sel.x, sel.y);
     let c_line2 = std::ffi::CString::new(line2.as_str()).unwrap();
 
-    // Position icon (crosshair dot)
     xlib::XSetForeground(display, gc, PANEL_ACCENT);
     xlib::XFillRectangle(display, buf, gc, px + 14, py + 31, 4, 4);
 
@@ -612,7 +650,6 @@ unsafe fn draw_info_panel(
 
 // ─── Help bar ────────────────────────────────────────────────────────────────
 
-/// Top help bar with keyboard shortcuts and instructions
 unsafe fn draw_help_bar(
     display: *mut xlib::Display,
     buf: xlib::Pixmap,
@@ -622,26 +659,20 @@ unsafe fn draw_help_bar(
 ) {
     let bar_h: u32 = 28;
 
-    // Semi-dark background bar
     xlib::XSetForeground(display, gc, HELP_BG);
     xlib::XFillRectangle(display, buf, gc, 0, 0, sw, bar_h);
-
-    // Bottom border line
     xlib::XSetForeground(display, gc, 0x33_33_55);
     xlib::XDrawLine(display, buf, gc, 0, bar_h as i32, sw as i32, bar_h as i32);
 
-    // ── App name ──────────────────────────────────────────────────────────
     let app_name = "MintShot";
     let c_app = std::ffi::CString::new(app_name).unwrap();
     xlib::XSetForeground(display, gc, PANEL_ACCENT);
     xlib::XDrawString(display, buf, gc, 12, 18,
                       c_app.as_ptr(), app_name.len() as i32);
 
-    // ── Separator ─────────────────────────────────────────────────────────
     xlib::XSetForeground(display, gc, 0x44_44_66);
     xlib::XDrawLine(display, buf, gc, 80, 5, 80, bar_h as i32 - 5);
 
-    // ── Instructions based on state ───────────────────────────────────────
     let instructions: &[(&str, &str)] = if has_selection {
         &[("Release", "Capture"), ("ESC", "Cancel"), ("Right Click", "Cancel")]
     } else {
@@ -651,13 +682,11 @@ unsafe fn draw_help_bar(
     let mut offset_x: i32 = 92;
 
     for (key, desc) in instructions {
-        // Key badge background
         let key_w = (key.len() as i32) * 7 + 10;
         xlib::XSetForeground(display, gc, HELP_KEY_BG);
         xlib::XFillRectangle(display, buf, gc,
             offset_x, 5, key_w as u32, 18);
 
-        // Key text
         let c_key = std::ffi::CString::new(*key).unwrap();
         xlib::XSetForeground(display, gc, HELP_KEY_TEXT);
         xlib::XDrawString(display, buf, gc, offset_x + 5, 18,
@@ -665,7 +694,6 @@ unsafe fn draw_help_bar(
 
         offset_x += key_w + 4;
 
-        // Description text
         let c_desc = std::ffi::CString::new(*desc).unwrap();
         xlib::XSetForeground(display, gc, HELP_TEXT);
         xlib::XDrawString(display, buf, gc, offset_x, 18,

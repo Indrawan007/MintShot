@@ -1,10 +1,10 @@
 //! Main capture orchestration module
 //!
-//! 1. Show overlay for region selection
-//! 2. Capture selected region (XGetImage)
-//! 3. Save to PNG file
-//! 4. Auto-copy to clipboard (ready to paste immediately)
-//! 5. Desktop notification with result
+//! Flow:
+//! 1. Show overlay → captures screen BEFORE overlay appears
+//! 2. User selects region
+//! 3. Pixels are cropped from pre-overlay image (guaranteed clean)
+//! 4. Save PNG + copy to clipboard + notification
 
 use log::{info, warn};
 use std::error::Error;
@@ -12,11 +12,10 @@ use std::error::Error;
 use crate::clipboard;
 use crate::overlay;
 use crate::save;
-use crate::selection::SelectionRect;
 
 /// Take a partial screenshot — main entry point
 pub fn take_partial_screenshot() -> Result<String, Box<dyn Error>> {
-    // Step 1: Open display and get screen info
+    // Step 1: Open display
     let (display, screen_width, screen_height, root) = unsafe {
         let display = x11::xlib::XOpenDisplay(std::ptr::null());
         if display.is_null() {
@@ -29,123 +28,67 @@ pub fn take_partial_screenshot() -> Result<String, Box<dyn Error>> {
         (display, width, height, root)
     };
 
-    info!("Screen dimensions: {}x{}", screen_width, screen_height);
+    info!("Screen: {}x{}", screen_width, screen_height);
 
-    // Step 2: Show overlay and get user selection
-    let selection = overlay::show_selection_overlay(
+    // Step 2: Show overlay → returns BOTH selection AND clean pixels
+    // The overlay captures the screen BEFORE showing itself, then crops
+    // from that clean capture. No overlay artifacts possible.
+    let capture_result = overlay::show_selection_overlay(
         display, root, screen_width, screen_height,
     )?;
 
+    let sel = &capture_result.selection;
+
     info!(
         "Selection: {}x{} at ({}, {})",
-        selection.width, selection.height, selection.x, selection.y
+        sel.width, sel.height, sel.x, sel.y
     );
 
-    if selection.width < 2 || selection.height < 2 {
-        unsafe { x11::xlib::XCloseDisplay(display); }
-        return Err("Selection too small, cancelled".into());
-    }
-
-    // Step 3: Capture the selected region
-    let pixels = capture_region(display, root, &selection)?;
-
-    // Step 4: Close X display — done with screen access
+    // Step 3: Close display — done with X11
     unsafe { x11::xlib::XCloseDisplay(display); }
 
-    // Step 5: Save PNG file
-    let filepath = save::save_png(&pixels, selection.width, selection.height)?;
+    // Step 4: Save PNG from the clean pixels
+    let filepath = save::save_png(
+        &capture_result.pixels,
+        sel.width,
+        sel.height,
+    )?;
     info!("Saved: {}", filepath);
 
-    // Step 6: Auto-copy to clipboard (immediately ready to Ctrl+V)
+    // Step 5: Auto-copy to clipboard
     let clipboard_ok = match clipboard::copy_to_clipboard(&filepath) {
         Ok(()) => {
-            info!("Screenshot copied to clipboard — ready to paste!");
+            info!("Copied to clipboard — ready to paste!");
             true
         }
         Err(e) => {
-            warn!("Clipboard copy failed: {} (screenshot still saved to file)", e);
+            warn!("Clipboard failed: {} (file still saved)", e);
             false
         }
     };
 
-    // Step 7: Desktop notification
-    send_notification(&filepath, &selection, clipboard_ok);
+    // Step 6: Desktop notification
+    send_notification(&filepath, sel.width, sel.height, clipboard_ok);
 
     Ok(filepath)
 }
 
-/// Capture a specific region from the root window
-fn capture_region(
-    display: *mut x11::xlib::Display,
-    root: x11::xlib::Window,
-    sel: &SelectionRect,
-) -> Result<Vec<u8>, Box<dyn Error>> {
-    unsafe {
-        let image = x11::xlib::XGetImage(
-            display, root,
-            sel.x as i32, sel.y as i32,
-            sel.width, sel.height,
-            x11::xlib::XAllPlanes(),
-            x11::xlib::ZPixmap,
-        );
-
-        if image.is_null() {
-            return Err("XGetImage failed".into());
-        }
-
-        let img       = &*image;
-        let total_px  = (sel.width * sel.height) as usize;
-        let mut pixels = Vec::with_capacity(total_px * 4);
-
-        let data = img.data as *const u8;
-        let bpl  = img.bytes_per_line as usize;
-        let bpp  = (img.bits_per_pixel / 8) as usize;
-
-        for y in 0..sel.height as usize {
-            let row = y * bpl;
-            for x in 0..sel.width as usize {
-                let off = row + x * bpp;
-                let b = *data.add(off);
-                let g = *data.add(off + 1);
-                let r = *data.add(off + 2);
-                let a = if bpp == 4 { *data.add(off + 3) } else { 255 };
-                pixels.push(r);
-                pixels.push(g);
-                pixels.push(b);
-                pixels.push(a);
-            }
-        }
-
-        x11::xlib::XDestroyImage(image);
-        Ok(pixels)
-    }
-}
-
-/// Send desktop notification with capture result
-fn send_notification(filepath: &str, sel: &SelectionRect, clipboard_ok: bool) {
-    let clipboard_status = if clipboard_ok {
-        "📋 Copied to clipboard — ready to paste!"
+/// Desktop notification with result
+fn send_notification(filepath: &str, w: u32, h: u32, clipboard_ok: bool) {
+    let status = if clipboard_ok {
+        "📋 Copied to clipboard — Ctrl+V to paste!"
     } else {
-        "⚠ Clipboard unavailable — file saved only"
+        "⚠ Clipboard unavailable — file saved"
     };
 
-    let body = format!(
-        "{}×{} px\n{}\n{}",
-        sel.width, sel.height,
-        clipboard_status,
-        filepath,
-    );
+    let body = format!("{}×{} px\n{}\n{}", w, h, status, filepath);
 
-    match std::process::Command::new("notify-send")
+    let _ = std::process::Command::new("notify-send")
         .arg("--app-name=MintShot")
         .arg("--icon=accessories-screenshot")
         .arg("--urgency=low")
         .arg("--expire-time=4000")
-        .arg("MintShot — Screenshot Captured! ✓")
+        .arg("MintShot — Screenshot Captured ✓")
         .arg(&body)
-        .spawn()
-    {
-        Ok(_)  => info!("Notification sent"),
-        Err(e) => info!("notify-send unavailable (non-fatal): {}", e),
-    }
+        .spawn();
 }
