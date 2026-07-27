@@ -23,6 +23,9 @@ Built with Rust for maximum performance and minimal resource usage.
 | Flameshot   | 25 MB     | 60 MB         | ~500ms      |
 | Shutter     | 80 MB     | 120 MB        | ~2000ms     |
 
+## Download
+--> https://github.com/Indrawan007/MintShot/releases/tag/v1.1.0
+
 ## Installation
 
 ```bash
