@@ -16,7 +16,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 fn main() {
-    // Minimal logger — no timestamps, no module paths
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info"),
     )
@@ -24,14 +23,22 @@ fn main() {
     .format_module_path(false)
     .init();
 
-    info!("MintShot v1.0.0 — Partial Screenshot Tool");
+    info!("MintShot v1.1.1 — Partial Screenshot Tool");
 
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(String::as_str) {
         Some("--capture") => run_capture(),
         Some("--daemon")  => run_daemon(),
-        _                 => run_capture(), // default: take screenshot now
+        Some("--version") | Some("-v") => {
+            println!("MintShot v1.1.1");
+            println!("Lightweight partial screenshot tool");
+            println!("Build: {}", env!("CARGO_PKG_VERSION"));
+        }
+        Some("--help") | Some("-h") => {
+            print_help();
+        }
+        _ => run_capture(),
     }
 }
 
@@ -50,6 +57,35 @@ fn run_capture() {
             }
         }
     }
+}
+
+fn print_help() {
+    println!("MintShot v1.1.1 — Lightweight Partial Screenshot Tool");
+    println!();
+    println!("USAGE:");
+    println!("  mintshot [OPTIONS]");
+    println!();
+    println!("OPTIONS:");
+    println!("  (no args)    Take a screenshot immediately");
+    println!("  --capture    Same as no args");
+    println!("  --daemon     Run as background hotkey listener");
+    println!("  --version    Show version");
+    println!("  --help       Show this help");
+    println!();
+    println!("HOTKEY (daemon mode):");
+    println!("  Ctrl+Shift+S    Take screenshot");
+    println!();
+    println!("CONTROLS (during capture):");
+    println!("  Click+Drag      Select region");
+    println!("  Release         Confirm & save");
+    println!("  Enter           Confirm current selection");
+    println!("  ESC / Q         Cancel");
+    println!("  Right Click     Cancel");
+    println!();
+    println!("FILES:");
+    println!("  ~/Pictures/MintShot/    Screenshot save directory");
+    println!();
+    println!("Screenshots are auto-copied to clipboard (Ctrl+V ready).");
 }
 
 /// Run as a background daemon that listens for Ctrl+Shift+S.
