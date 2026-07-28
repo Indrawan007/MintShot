@@ -106,10 +106,15 @@ unsafe fn run_overlay(
     let depth    = xlib::XDefaultDepth(display, screen);
     let colormap = xlib::XDefaultColormap(display, screen);
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // CRITICAL: Capture the ENTIRE screen BEFORE creating the overlay.
-    // This is the CLEAN image we will crop from later.
-    // ═══════════════════════════════════════════════════════════════════════
+    // ─── Pre-compute keycodes for reliable key detection ──────────────────
+    let escape_keycode = xlib::XKeysymToKeycode(display, keysym::XK_Escape as u64);
+    let q_keycode      = xlib::XKeysymToKeycode(display, keysym::XK_q as u64);
+    let return_keycode = xlib::XKeysymToKeycode(display, keysym::XK_Return as u64);
+
+    info!("Key mappings: ESC={}, Q={}, Enter={}",
+          escape_keycode, q_keycode, return_keycode);
+
+    // ─── Capture screen BEFORE overlay ─────────────────────────────────────
     let bg = xlib::XGetImage(
         display, root, 0, 0, sw, sh,
         xlib::XAllPlanes(), xlib::ZPixmap,
@@ -118,14 +123,16 @@ unsafe fn run_overlay(
         return Err("Failed to capture background".into());
     }
 
-    // Create overlay window
+    // ─── Create overlay window ─────────────────────────────────────────────
     let mut attrs: xlib::XSetWindowAttributes = std::mem::zeroed();
     attrs.override_redirect = xlib::True;
     attrs.event_mask        = xlib::ExposureMask
         | xlib::ButtonPressMask
         | xlib::ButtonReleaseMask
         | xlib::PointerMotionMask
-        | xlib::KeyPressMask;
+        | xlib::KeyPressMask
+        | xlib::KeyReleaseMask
+        | xlib::FocusChangeMask;
     attrs.colormap          = colormap;
     attrs.background_pixel  = 0;
 
@@ -137,25 +144,77 @@ unsafe fn run_overlay(
         &mut attrs,
     );
 
+    // Explicitly select KeyPress events (redundant but safe)
+    xlib::XSelectInput(
+        display, win,
+        xlib::ExposureMask
+            | xlib::ButtonPressMask
+            | xlib::ButtonReleaseMask
+            | xlib::PointerMotionMask
+            | xlib::KeyPressMask
+            | xlib::KeyReleaseMask
+            | xlib::FocusChangeMask,
+    );
+
     xlib::XMapRaised(display, win);
+    xlib::XSync(display, xlib::False);
 
+    // ─── Grab pointer with retry ───────────────────────────────────────────
     let cursor_font = xlib::XCreateFontCursor(display, XC_CROSSHAIR);
-    xlib::XGrabPointer(
-        display, win, xlib::True,
-        (xlib::ButtonPressMask | xlib::ButtonReleaseMask
-            | xlib::PointerMotionMask) as u32,
-        xlib::GrabModeAsync, xlib::GrabModeAsync,
-        win, cursor_font, xlib::CurrentTime,
-    );
-    xlib::XGrabKeyboard(
-        display, win, xlib::True,
-        xlib::GrabModeAsync, xlib::GrabModeAsync, xlib::CurrentTime,
-    );
 
+    let mut grab_attempts = 0;
+    loop {
+        let result = xlib::XGrabPointer(
+            display, win, xlib::True,
+            (xlib::ButtonPressMask | xlib::ButtonReleaseMask
+                | xlib::PointerMotionMask) as u32,
+            xlib::GrabModeAsync, xlib::GrabModeAsync,
+            win, cursor_font, xlib::CurrentTime,
+        );
+
+        if result == xlib::GrabSuccess {
+            info!("Pointer grabbed successfully");
+            break;
+        }
+
+        grab_attempts += 1;
+        if grab_attempts > 20 {
+            info!("Warning: XGrabPointer failed after 20 attempts (code {})", result);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    // ─── Grab keyboard with retry (CRITICAL for ESC) ───────────────────────
+    grab_attempts = 0;
+    loop {
+        let result = xlib::XGrabKeyboard(
+            display, win, xlib::True,
+            xlib::GrabModeAsync, xlib::GrabModeAsync,
+            xlib::CurrentTime,
+        );
+
+        if result == xlib::GrabSuccess {
+            info!("Keyboard grabbed successfully");
+            break;
+        }
+
+        grab_attempts += 1;
+        if grab_attempts > 20 {
+            info!("Warning: XGrabKeyboard failed after 20 attempts (ESC may not work)");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    // Force input focus to our window
+    xlib::XSetInputFocus(display, win, xlib::RevertToParent, xlib::CurrentTime);
+    xlib::XSync(display, xlib::False);
+
+    // ─── Create GC & pixmap buffer ─────────────────────────────────────────
     let gc  = xlib::XCreateGC(display, win, 0, ptr::null_mut());
     let buf = xlib::XCreatePixmap(display, win, sw, sh, depth as u32);
 
-    // Load font
     let font_name = std::ffi::CString::new(
         "-*-fixed-bold-r-*-*-13-*-*-*-*-*-iso8859-1"
     ).unwrap();
@@ -169,7 +228,7 @@ unsafe fn run_overlay(
     blit(display, buf, win, gc, sw, sh);
     xlib::XFlush(display);
 
-    // ── Event loop ────────────────────────────────────────────────────────
+    // ─── Event loop ───────────────────────────────────────────────────────
     let mut event: xlib::XEvent              = std::mem::zeroed();
     let mut drag                              = DragState::new();
     let mut cursor: Option<CursorPos>         = None;
@@ -179,19 +238,40 @@ unsafe fn run_overlay(
         xlib::XNextEvent(display, &mut event);
 
         match event.get_type() {
+            // ── Expose ────────────────────────────────────────────────────
             xlib::Expose => {
                 blit(display, buf, win, gc, sw, sh);
             }
 
+            // ── Focus events (log for debug) ──────────────────────────────
+            xlib::FocusIn => {
+                info!("Window gained focus");
+            }
+            xlib::FocusOut => {
+                info!("Window lost focus — re-grabbing keyboard");
+                // Re-grab keyboard if focus is lost
+                xlib::XGrabKeyboard(
+                    display, win, xlib::True,
+                    xlib::GrabModeAsync, xlib::GrabModeAsync,
+                    xlib::CurrentTime,
+                );
+                xlib::XSetInputFocus(display, win, xlib::RevertToParent, xlib::CurrentTime);
+            }
+
+            // ── Button Press ──────────────────────────────────────────────
             xlib::ButtonPress => {
                 let btn = event.button;
                 match btn.button {
                     1 => drag.begin(btn.x, btn.y),
-                    3 => break 'event_loop,
+                    3 => {
+                        info!("Right click — cancelling");
+                        break 'event_loop;
+                    }
                     _ => {}
                 }
             }
 
+            // ── Motion Notify ─────────────────────────────────────────────
             xlib::MotionNotify => {
                 let mut mx = event.motion.x;
                 let mut my = event.motion.y;
@@ -215,6 +295,7 @@ unsafe fn run_overlay(
                 xlib::XFlush(display);
             }
 
+            // ── Button Release ────────────────────────────────────────────
             xlib::ButtonRelease => {
                 let btn = event.button;
                 if btn.button == 1 && drag.active {
@@ -226,11 +307,42 @@ unsafe fn run_overlay(
                 }
             }
 
+            // ── Key Press (ROBUST HANDLING) ───────────────────────────────
             xlib::KeyPress => {
-                let sym = xlib::XLookupKeysym(&mut event.key, 0);
-                if sym == keysym::XK_Escape as u64 {
-                    info!("Selection cancelled (ESC)");
+                let key_event = event.key;
+                let keycode = key_event.keycode;
+
+                info!("KeyPress: keycode={}", keycode);
+
+                // Method 1: Check by keycode (most reliable)
+                if keycode == escape_keycode as u32 || keycode == q_keycode as u32 {
+                    info!("Cancel key detected (keycode match)");
                     break 'event_loop;
+                }
+
+                // Method 2: Check via keysym (backup)
+                let sym = xlib::XLookupKeysym(&mut event.key, 0);
+                if sym == keysym::XK_Escape as u64
+                    || sym == keysym::XK_q as u64
+                    || sym == keysym::XK_Q as u64
+                {
+                    info!("Cancel key detected (keysym match): 0x{:x}", sym);
+                    break 'event_loop;
+                }
+
+                // Enter to confirm active selection
+                if drag.active
+                    && (keycode == return_keycode as u32
+                        || sym == keysym::XK_Return as u64)
+                {
+                    if let Some(c) = cursor.as_ref() {
+                        let sel = drag.to_selection(c.x, c.y);
+                        if sel.is_valid() {
+                            info!("Selection confirmed via Enter");
+                            result_sel = Some(sel);
+                            break 'event_loop;
+                        }
+                    }
                 }
             }
 
@@ -238,12 +350,10 @@ unsafe fn run_overlay(
         }
     }
 
-    // Ensure X11 is fully synced before we read pixel data
+    // Ensure X11 is fully synced
     xlib::XSync(display, xlib::False);
 
-    // ══════════════════════════════════════════════════════════════════════
-    // Extract clean pixels from bg BEFORE destroying it.
-    // ══════════════════════════════════════════════════════════════════════
+    // ─── Extract clean pixels ─────────────────────────────────────────────
     let result: Option<CaptureResult> = match result_sel {
         Some(sel) => {
             let pixels = extract_region_from_ximage(bg, &sel);
@@ -254,7 +364,7 @@ unsafe fn run_overlay(
         None => None,
     };
 
-    // ── Cleanup ───────────────────────────────────────────────────────────
+    // ─── Cleanup ───────────────────────────────────────────────────────────
     xlib::XUngrabPointer(display, xlib::CurrentTime);
     xlib::XUngrabKeyboard(display, xlib::CurrentTime);
     xlib::XFreeCursor(display, cursor_font);
@@ -265,7 +375,6 @@ unsafe fn run_overlay(
     xlib::XDestroyWindow(display, win);
     xlib::XFlush(display);
 
-    // Return the extracted result
     result.ok_or_else(|| "Selection cancelled".into())
 }
 
@@ -673,10 +782,21 @@ unsafe fn draw_help_bar(
     xlib::XSetForeground(display, gc, 0x44_44_66);
     xlib::XDrawLine(display, buf, gc, 80, 5, 80, bar_h as i32 - 5);
 
+    // Updated shortcuts including ESC, Q, Enter
     let instructions: &[(&str, &str)] = if has_selection {
-        &[("Release", "Capture"), ("ESC", "Cancel"), ("Right Click", "Cancel")]
+        &[
+            ("Release", "Capture"),
+            ("Enter", "Confirm"),
+            ("ESC", "Cancel"),
+            ("Q", "Cancel"),
+        ]
     } else {
-        &[("Click+Drag", "Select area"), ("ESC", "Cancel"), ("Right Click", "Cancel")]
+        &[
+            ("Click+Drag", "Select area"),
+            ("ESC", "Cancel"),
+            ("Q", "Cancel"),
+            ("Right Click", "Cancel"),
+        ]
     };
 
     let mut offset_x: i32 = 92;
