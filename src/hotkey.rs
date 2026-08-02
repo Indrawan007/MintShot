@@ -4,9 +4,13 @@
 //! Hotkey: Ctrl+Shift+S
 //!
 //! v1.1.2: Added display retry logic for early boot startup
+//! v1.1.3: Detect BadAccess conflict via error handler (XGrabKey return is meaningless)
 
 use log::{error, info, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
+use nix::errno::Errno;
+use nix::poll::{poll, PollFd, PollFlags};
+use std::os::unix::io::BorrowedFd;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -20,12 +24,37 @@ const CTRL_SHIFT_MASK: u32 = xlib::ControlMask | xlib::ShiftMask;
 /// is ready (e.g. during early boot via systemd user service).
 const DISPLAY_WAIT_TIMEOUT_SECS: u64 = 60;
 
+/// Number of X errors delivered while registering the hotkey.
+/// XGrabKey() ALWAYS returns 1 (even on conflict) — the real result arrives
+/// asynchronously as a BadAccess error through the error handler. So we count
+/// errors instead of trusting the return value.
+static X_ERRORS: AtomicUsize = AtomicUsize::new(0);
+
+/// Xlib's default error handler exits the process on ANY X error — including
+/// the expected `BadAccess` when Ctrl+Shift+S is already grabbed by another
+/// client. Count errors instead so we can report the conflict gracefully.
+extern "C" fn count_x_error(
+    _display: *mut xlib::Display,
+    error: *mut xlib::XErrorEvent,
+) -> i32 {
+    unsafe {
+        let code = (*error).error_code;
+        if code == xlib::BadAccess {
+            warn!("X BadAccess error while grabbing hotkey (code {})", code);
+        }
+    }
+    X_ERRORS.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
 /// Listen for the Ctrl+Shift+S global hotkey.
 pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
     // ─── Wait for X display to be available ───────────────────────────────
     let display = wait_for_display(DISPLAY_WAIT_TIMEOUT_SECS)?;
 
     unsafe {
+        xlib::XSetErrorHandler(Some(count_x_error));
+
         let root = xlib::XDefaultRootWindow(display);
 
         // Get keycode for 'S'
@@ -45,10 +74,12 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), Box<dyn std::error:
             CTRL_SHIFT_MASK | xlib::Mod2Mask | xlib::LockMask,
         ];
 
-        let mut grab_success = false;
+        // NOTE: XGrabKey() returns 1 whether it succeeded or conflicted, so we
+        // cannot trust its return value. Instead, reset the error counter, do
+        // all grabs, sync, then check how many BadAccess errors were delivered.
+        X_ERRORS.store(0, Ordering::Relaxed);
         for &modifier in &modifiers {
-            // Set X error handler to catch grab conflicts
-            let result = xlib::XGrabKey(
+            xlib::XGrabKey(
                 display,
                 keycode as i32,
                 modifier,
@@ -57,77 +88,96 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), Box<dyn std::error:
                 xlib::GrabModeAsync,
                 xlib::GrabModeAsync,
             );
-
-            if result != 0 {
-                grab_success = true;
-            } else {
-                warn!("Could not grab key with modifier mask {}", modifier);
-            }
         }
-
-        if !grab_success {
-            xlib::XCloseDisplay(display);
-            return Err("Failed to grab hotkey — another app may have Ctrl+Shift+S bound".into());
-        }
-
         xlib::XSync(display, xlib::False);
+
+        let grab_errors = X_ERRORS.load(Ordering::Relaxed);
+        if grab_errors > 0 {
+            if grab_errors >= modifiers.len() {
+                xlib::XCloseDisplay(display);
+                return Err(
+                    "Failed to grab hotkey Ctrl+Shift+S — another app already has it bound"
+                        .into(),
+                );
+            }
+            warn!(
+                "{} of {} hotkey combos are grabbed by another app — \
+                 hotkey may not work with NumLock/CapsLock active",
+                grab_errors,
+                modifiers.len()
+            );
+        }
+
         info!("✓ Global hotkey Ctrl+Shift+S registered successfully");
         info!("Daemon is ready. Press Ctrl+Shift+S to take a screenshot.");
 
         // ─── Event loop ────────────────────────────────────────────────────
+        // Block on poll() instead of busy-sleeping. POLLHUP/POLLERR/POLLNVAL
+        // mean the X connection died (X server restarted / logged out) — the
+        // old check `XConnectionNumber < 0` could never fire, so the daemon
+        // used to hang forever in that case.
+        let conn_fd = BorrowedFd::borrow_raw(xlib::XConnectionNumber(display));
         let mut event: xlib::XEvent = std::mem::zeroed();
-        let mut consecutive_errors = 0u32;
 
-        while running.load(Ordering::Relaxed) {
-            let pending = xlib::XPending(display);
+        'event_loop: while running.load(Ordering::Relaxed) {
+            let mut pfd = PollFd::new(&conn_fd, PollFlags::POLLIN);
 
-            if pending > 0 {
-                consecutive_errors = 0;
-                xlib::XNextEvent(display, &mut event);
+            match poll(std::slice::from_mut(&mut pfd), 1000) {
+                // Timeout — loop around to re-check the running flag.
+                Ok(0) => continue,
+                Ok(_) => {
+                    let revents = pfd.revents().unwrap_or(PollFlags::empty());
+                    if revents.intersects(
+                        PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL,
+                    ) {
+                        error!("X display connection lost — exiting");
+                        break 'event_loop;
+                    }
 
-                if event.get_type() == xlib::KeyPress {
-                    let key_event = event.key;
-                    let clean_state = key_event.state & !(xlib::Mod2Mask | xlib::LockMask);
+                    // Drain all pending events, then go back to poll().
+                    while xlib::XPending(display) > 0 {
+                        xlib::XNextEvent(display, &mut event);
 
-                    if key_event.keycode == keycode as u32
-                        && clean_state == CTRL_SHIFT_MASK
-                    {
-                        info!("🎯 Hotkey Ctrl+Shift+S detected — spawning capture...");
+                        if event.get_type() == xlib::KeyPress {
+                            let key_event = event.key;
+                            let clean_state =
+                                key_event.state & !(xlib::Mod2Mask | xlib::LockMask);
 
-                        match std::env::current_exe() {
-                            Ok(exe) => {
-                                match std::process::Command::new(&exe)
-                                    .arg("--capture")
-                                    .spawn()
-                                {
-                                    Ok(child) => {
-                                        info!("Capture process spawned (pid {})", child.id());
+                            if key_event.keycode == keycode as u32
+                                && clean_state == CTRL_SHIFT_MASK
+                            {
+                                info!("🎯 Hotkey Ctrl+Shift+S detected — spawning capture...");
+
+                                match std::env::current_exe() {
+                                    Ok(exe) => {
+                                        match std::process::Command::new(&exe)
+                                            .arg("--capture")
+                                            .spawn()
+                                        {
+                                            Ok(child) => {
+                                                info!("Capture process spawned (pid {})",
+                                                      child.id());
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to spawn capture: {}", e);
+                                            }
+                                        }
                                     }
                                     Err(e) => {
-                                        error!("Failed to spawn capture: {}", e);
+                                        error!("Cannot get current exe path: {}", e);
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                error!("Cannot get current exe path: {}", e);
                             }
                         }
                     }
                 }
-            } else {
-                // Sleep briefly to avoid busy-waiting
-                thread::sleep(Duration::from_millis(50));
-
-                // Health check: verify display is still alive every ~5 seconds
-                if consecutive_errors > 100 {
-                    // Try a benign X operation to check connection
-                    if xlib::XConnectionNumber(display) < 0 {
-                        error!("X display connection lost!");
-                        break;
-                    }
-                    consecutive_errors = 0;
+                // Signal interrupted the wait (e.g. SIGINT/SIGTERM) — loop
+                // around so the running flag is re-checked for a clean exit.
+                Err(Errno::EINTR) => continue,
+                Err(e) => {
+                    error!("poll() error: {} — exiting", e);
+                    break 'event_loop;
                 }
-                consecutive_errors += 1;
             }
         }
 
@@ -187,7 +237,7 @@ fn wait_for_display(timeout_secs: u64) -> Result<*mut xlib::Display, Box<dyn std
         if attempt == 1 {
             info!("Waiting for X display to become available...");
             info!("DISPLAY env: '{}'", display_env);
-        } else if attempt % 10 == 0 {
+        } else if attempt.is_multiple_of(10) {
             info!("Still waiting for X display... ({}s elapsed)", elapsed);
         }
 

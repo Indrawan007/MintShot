@@ -38,6 +38,25 @@ const HELP_KEY_BG: u64      = 0x33_33_55;
 const HELP_KEY_TEXT: u64     = 0xFF_FF_FF;
 const XC_CROSSHAIR: u32     = 34;
 
+/// Xlib's default error handler calls exit(1) on ANY X error (e.g. a
+/// transient BadMatch/BadDrawable during grab races or drawing), which would
+/// kill the capture without cleanup. Ignore errors instead — we own the
+/// overlay window and validate everything we draw.
+extern "C" fn ignore_x_error(
+    _display: *mut xlib::Display,
+    _error: *mut xlib::XErrorEvent,
+) -> i32 {
+    0
+}
+
+/// Candidate fonts, tried in order. The final "fixed" font is guaranteed to
+/// exist on every X server, so this effectively cannot fail.
+const FONT_CANDIDATES: [&str; 3] = [
+    "-*-fixed-bold-r-*-*-13-*-*-*-*-*-iso8859-1",
+    "-*-*-*-r-*-*-13-*",
+    "fixed",
+];
+
 // ─── Drag state ───────────────────────────────────────────────────────────────
 
 struct DragState {
@@ -123,6 +142,9 @@ unsafe fn run_overlay(
         return Err("Failed to capture background".into());
     }
 
+    // Prevent Xlib's default error handler from killing the process.
+    xlib::XSetErrorHandler(Some(ignore_x_error));
+
     // ─── Create overlay window ─────────────────────────────────────────────
     let mut attrs: xlib::XSetWindowAttributes = std::mem::zeroed();
     attrs.override_redirect = xlib::True;
@@ -179,8 +201,14 @@ unsafe fn run_overlay(
 
         grab_attempts += 1;
         if grab_attempts > 20 {
-            info!("Warning: XGrabPointer failed after 20 attempts (code {})", result);
-            break;
+            // Don't continue without a pointer grab — the event loop would
+            // block forever waiting for events that never arrive.
+            xlib::XFreeCursor(display, cursor_font);
+            xlib::XDestroyWindow(display, win);
+            xlib::XDestroyImage(bg);
+            return Err(
+                "Failed to grab pointer after retries — another app may be holding a grab".into(),
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -201,8 +229,11 @@ unsafe fn run_overlay(
 
         grab_attempts += 1;
         if grab_attempts > 20 {
-            info!("Warning: XGrabKeyboard failed after 20 attempts (ESC may not work)");
-            break;
+            xlib::XFreeCursor(display, cursor_font);
+            xlib::XUngrabPointer(display, xlib::CurrentTime);
+            xlib::XDestroyWindow(display, win);
+            xlib::XDestroyImage(bg);
+            return Err("Failed to grab keyboard after retries".into());
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -211,20 +242,36 @@ unsafe fn run_overlay(
     xlib::XSetInputFocus(display, win, xlib::RevertToParent, xlib::CurrentTime);
     xlib::XSync(display, xlib::False);
 
-    // ─── Create GC & pixmap buffer ─────────────────────────────────────────
+    // ─── Create GC & pixmap buffers ────────────────────────────────────────
     let gc  = xlib::XCreateGC(display, win, 0, ptr::null_mut());
     let buf = xlib::XCreatePixmap(display, win, sw, sh, depth as u32);
 
-    let font_name = std::ffi::CString::new(
-        "-*-fixed-bold-r-*-*-13-*-*-*-*-*-iso8859-1"
-    ).unwrap();
-    let font = xlib::XLoadQueryFont(display, font_name.as_ptr());
-    if !font.is_null() {
-        xlib::XSetFont(display, gc, (*font).fid);
+    // Try the font candidates in order until one loads.
+    let mut font: *mut xlib::XFontStruct = ptr::null_mut();
+    for name in FONT_CANDIDATES {
+        let font_name = std::ffi::CString::new(name).unwrap();
+        let f = xlib::XLoadQueryFont(display, font_name.as_ptr());
+        if !f.is_null() {
+            font = f;
+            xlib::XSetFont(display, gc, (*font).fid);
+            break;
+        }
     }
 
+    // ─── Cache background pixmaps (built ONCE, reused every frame) ────────
+    // Previously every mouse-move redrew the whole screen by pushing the
+    // full XImage over the socket (XPutImage ≈ 8MB for 1080p). Now the
+    // background is uploaded once into two server-side pixmaps and each
+    // frame only does fast server-side XCopyArea blits.
+    let bg_clean = xlib::XCreatePixmap(display, win, sw, sh, depth as u32);
+    let bg_dim   = xlib::XCreatePixmap(display, win, sw, sh, depth as u32);
+    xlib::XPutImage(display, bg_clean, gc, bg, 0, 0, 0, 0, sw, sh);
+    xlib::XCopyArea(display, bg_clean, bg_dim, gc, 0, 0, sw, sh, 0, 0);
+    draw_dim_overlay(display, bg_dim, gc, sw, sh);
+    xlib::XSync(display, xlib::False);
+
     // Initial draw
-    full_redraw(display, buf, gc, bg, sw, sh, None, None);
+    full_redraw(display, buf, gc, bg_clean, bg_dim, sw, sh, None, None);
     blit(display, buf, win, gc, sw, sh);
     xlib::XFlush(display);
 
@@ -289,7 +336,7 @@ unsafe fn run_overlay(
 
                 let sel = drag.active.then(|| drag.to_selection(mx, my));
 
-                full_redraw(display, buf, gc, bg, sw, sh,
+                full_redraw(display, buf, gc, bg_clean, bg_dim, sw, sh,
                             sel.as_ref(), cursor.as_ref());
                 blit(display, buf, win, gc, sw, sh);
                 xlib::XFlush(display);
@@ -312,7 +359,7 @@ unsafe fn run_overlay(
                 let key_event = event.key;
                 let keycode = key_event.keycode;
 
-                info!("KeyPress: keycode={}", keycode);
+                log::debug!("KeyPress: keycode={}", keycode);
 
                 // Method 1: Check by keycode (most reliable)
                 if keycode == escape_keycode as u32 || keycode == q_keycode as u32 {
@@ -354,15 +401,20 @@ unsafe fn run_overlay(
     xlib::XSync(display, xlib::False);
 
     // ─── Extract clean pixels ─────────────────────────────────────────────
-    let result: Option<CaptureResult> = match result_sel {
-        Some(sel) => {
-            let pixels = extract_region_from_ximage(bg, &sel);
-            info!("Extracted {} bytes for {}x{} region",
-                  pixels.len(), sel.width, sel.height);
-            Some(CaptureResult { selection: sel, pixels })
+    // Clamp the selection to screen bounds FIRST so the returned rectangle
+    // always matches the extracted pixel buffer. Without this, a drag that
+    // ends off-screen produces a mismatched width/height vs. pixel count and
+    // a corrupted PNG.
+    let result: Option<CaptureResult> = result_sel.and_then(|sel| {
+        let sel = sel.clamped_to(sw, sh);
+        if !sel.is_valid() {
+            return None;
         }
-        None => None,
-    };
+        let pixels = extract_region_from_ximage(bg, &sel);
+        info!("Extracted {} bytes for {}x{} region",
+              pixels.len(), sel.width, sel.height);
+        Some(CaptureResult { selection: sel, pixels })
+    });
 
     // ─── Cleanup ───────────────────────────────────────────────────────────
     xlib::XUngrabPointer(display, xlib::CurrentTime);
@@ -370,6 +422,8 @@ unsafe fn run_overlay(
     xlib::XFreeCursor(display, cursor_font);
     if !font.is_null() { xlib::XFreeFont(display, font); }
     xlib::XFreeGC(display, gc);
+    xlib::XFreePixmap(display, bg_clean);
+    xlib::XFreePixmap(display, bg_dim);
     xlib::XFreePixmap(display, buf);
     xlib::XDestroyImage(bg);
     xlib::XDestroyWindow(display, win);
@@ -424,6 +478,40 @@ unsafe fn extract_region_from_ximage(
     let sel_y = sel.y.min(img_h.saturating_sub(1));
     let sel_w = sel.width.min(img_w.saturating_sub(sel_x));
     let sel_h = sel.height.min(img_h.saturating_sub(sel_y));
+
+    // ─── Fast path: standard 32-bit RGBX (memory bytes are B,G,R,X) ────────
+    // The most common layout on X11: 8 bits per channel, blue in the lowest
+    // byte. Just swap bytes — no per-pixel shift/mask work.
+    if bpp == 4 && red_mask == 0xFF_00_00 && green_mask == 0xFF_00 && blue_mask == 0xFF {
+        for y in 0..sel_h as usize {
+            let row = (sel_y as usize + y) * bytes_per_line;
+            let src = data.add(row + sel_x as usize * 4);
+            for x in 0..sel_w as usize {
+                let p = src.add(x * 4);
+                pixels.push(*p.add(2)); // R
+                pixels.push(*p.add(1)); // G
+                pixels.push(*p.add(0)); // B
+                pixels.push(255);
+            }
+        }
+        return pixels;
+    }
+
+    // ─── Fast path: standard 24-bit BGR (memory bytes are B,G,R) ───────────
+    if bpp == 3 && red_mask == 0xFF_00_00 && green_mask == 0xFF_00 && blue_mask == 0xFF {
+        for y in 0..sel_h as usize {
+            let row = (sel_y as usize + y) * bytes_per_line;
+            let src = data.add(row + sel_x as usize * 3);
+            for x in 0..sel_w as usize {
+                let p = src.add(x * 3);
+                pixels.push(*p.add(2)); // R
+                pixels.push(*p.add(1)); // G
+                pixels.push(*p.add(0)); // B
+                pixels.push(255);
+            }
+        }
+        return pixels;
+    }
 
     for y in 0..sel_h as usize {
         let src_y = sel_y as usize + y;
@@ -484,22 +572,24 @@ fn mask_shift(mask: u32) -> u32 {
 
 // ─── Full redraw ──────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn full_redraw(
     display: *mut xlib::Display,
     buf: xlib::Pixmap,
     gc: xlib::GC,
-    bg: *mut xlib::XImage,
+    bg_clean: xlib::Pixmap,
+    bg_dim: xlib::Pixmap,
     sw: u32,
     sh: u32,
     selection: Option<&SelectionRect>,
     cursor: Option<&CursorPos>,
 ) {
-    xlib::XPutImage(display, buf, gc, bg, 0, 0, 0, 0, sw, sh);
-    draw_dim_overlay(display, buf, gc, sw, sh);
+    // Server-side copy of the pre-dimmed background — no pixel data over the socket.
+    xlib::XCopyArea(display, bg_dim, buf, gc, 0, 0, sw, sh, 0, 0);
 
     match selection {
         Some(sel) if sel.is_valid() => {
-            draw_selection(display, buf, gc, bg, sw, sh, sel, cursor);
+            draw_selection(display, buf, gc, bg_clean, sw, sh, sel, cursor);
         }
         _ => {
             if let Some(c) = cursor {
@@ -544,11 +634,12 @@ unsafe fn draw_dim_overlay(
 
 // ─── Selection drawing ───────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn draw_selection(
     display: *mut xlib::Display,
     buf: xlib::Pixmap,
     gc: xlib::GC,
-    bg: *mut xlib::XImage,
+    bg_clean: xlib::Pixmap,
     sw: u32,
     sh: u32,
     sel: &SelectionRect,
@@ -582,10 +673,11 @@ unsafe fn draw_selection(
     xlib::XSetLineAttributes(display, gc, 1,
         xlib::LineSolid, xlib::CapButt, xlib::JoinMiter);
 
-    // Restore clear pixels from pre-overlay capture
-    xlib::XPutImage(
-        display, buf, gc, bg,
-        sx, sy, sx, sy, sel.width, sel.height,
+    // Restore clear pixels from the cached pre-overlay pixmap (server-side copy)
+    xlib::XCopyArea(
+        display, bg_clean, buf, gc,
+        sx, sy, sel.width, sel.height,
+        sx, sy,
     );
 
     // Shadow border

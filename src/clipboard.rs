@@ -31,12 +31,6 @@ pub fn copy_to_clipboard(filepath: &str) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    // Last resort: xdotool + xdg approach
-    if copy_with_xdg(filepath).is_ok() {
-        info!("Copied to clipboard via xdg");
-        return Ok(());
-    }
-
     // If all external tools fail, try arboard (but warn it may not persist)
     warn!("External clipboard tools not found, using arboard (may not persist)");
     copy_with_arboard(filepath)
@@ -65,7 +59,7 @@ fn copy_with_xclip(filepath: &str) -> Result<(), Box<dyn Error>> {
             e
         })?;
 
-    if let Some(ref mut stdin) = child.stdin {
+    if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(&png_data)?;
     }
 
@@ -92,36 +86,13 @@ fn copy_with_xsel(filepath: &str) -> Result<(), Box<dyn Error>> {
             e
         })?;
 
-    if let Some(ref mut stdin) = child.stdin {
+    if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(&png_data)?;
     }
 
     let status = child.wait()?;
     if !status.success() {
         return Err(format!("xsel exited with status: {}", status).into());
-    }
-
-    Ok(())
-}
-
-/// Copy using xdg-mime / xclip combination
-fn copy_with_xdg(filepath: &str) -> Result<(), Box<dyn Error>> {
-    let status = Command::new("xclip")
-        .args([
-            "-selection", "clipboard",
-            "-t", "image/png",
-            filepath,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| {
-            info!("xclip (file mode) not available: {}", e);
-            e
-        })?;
-
-    if !status.success() {
-        return Err("xclip file mode failed".into());
     }
 
     Ok(())

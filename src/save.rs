@@ -3,7 +3,7 @@
 //! Saves screenshot to ~/Pictures/MintShot/ directory
 //! Uses the `png` crate for efficient encoding with minimal memory allocation
 
-use chrono::Local;
+use chrono::{DateTime, Local};
 use log::info;
 use std::error::Error;
 use std::fs;
@@ -26,10 +26,9 @@ fn get_save_dir() -> Result<PathBuf, Box<dyn Error>> {
     Ok(save_dir)
 }
 
-/// Generate a unique filename with timestamp
-fn generate_filename() -> String {
-    let now = Local::now();
-    format!("mintshot_{}.png", now.format("%Y%m%d_%H%M%S"))
+/// Generate a unique filename with millisecond-precision timestamp
+fn generate_filename(now: &DateTime<Local>) -> String {
+    format!("mintshot_{}.png", now.format("%Y%m%d_%H%M%S%.3f"))
 }
 
 /// Save RGBA pixel data as a PNG file
@@ -42,8 +41,20 @@ pub fn save_png(
     height: u32,
 ) -> Result<String, Box<dyn Error>> {
     let save_dir = get_save_dir()?;
-    let filename = generate_filename();
-    let filepath = save_dir.join(&filename);
+    let now = Local::now();
+
+    // Millisecond timestamps still can collide (two captures in the same ms),
+    // so keep bumping a suffix until we hit a free filename.
+    let mut filepath = save_dir.join(generate_filename(&now));
+    let mut counter = 1u32;
+    while filepath.exists() {
+        filepath = save_dir.join(format!(
+            "mintshot_{}_{}.png",
+            now.format("%Y%m%d_%H%M%S%.3f"),
+            counter
+        ));
+        counter += 1;
+    }
 
     let file = fs::File::create(&filepath)?;
     let buf_writer = BufWriter::with_capacity(64 * 1024, file); // 64KB buffer

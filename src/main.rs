@@ -23,7 +23,7 @@ fn main() {
     .format_module_path(false)
     .init();
 
-    info!("MintShot v1.1.1 — Partial Screenshot Tool");
+    info!("MintShot {} — Partial Screenshot Tool", env!("CARGO_PKG_VERSION"));
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -31,7 +31,7 @@ fn main() {
         Some("--capture") => run_capture(),
         Some("--daemon")  => run_daemon(),
         Some("--version") | Some("-v") => {
-            println!("MintShot v1.1.1");
+            println!("MintShot v{}", env!("CARGO_PKG_VERSION"));
             println!("Lightweight partial screenshot tool");
             println!("Build: {}", env!("CARGO_PKG_VERSION"));
         }
@@ -60,7 +60,7 @@ fn run_capture() {
 }
 
 fn print_help() {
-    println!("MintShot v1.1.1 — Lightweight Partial Screenshot Tool");
+    println!("MintShot v{} — Lightweight Partial Screenshot Tool", env!("CARGO_PKG_VERSION"));
     println!();
     println!("USAGE:");
     println!("  mintshot [OPTIONS]");
