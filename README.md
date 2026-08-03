@@ -24,7 +24,7 @@ Built with Rust for maximum performance and minimal resource usage.
 | Shutter     | 80 MB     | 120 MB        | ~2000ms     |
 
 ## Download
---> https://github.com/Indrawan007/MintShot/releases/tag/v1.1.0
+--> https://github.com/Indrawan007/MintShot/releases/tag/v1.1.1
 
 ## Installation
 
