@@ -3,13 +3,18 @@
 //! Event-driven: zero CPU usage when idle (no polling).
 //! Hotkey: Ctrl+Shift+S
 //!
-//! v1.1.2: Added display retry logic for early boot startup
-//! v1.1.3: Detect BadAccess conflict via error handler (XGrabKey return is meaningless)
+//! FIXES APPLIED:
+//!   #1  — Signal handler sets running=false (not true)
+//!   #7  — attempt % 10 instead of is_multiple_of (stable Rust)
+//!   #9  — XSetErrorHandler restored after use
+//!   — resolve_capture_executable() fallback chain instead of current_exe() only
+//!   — Handles binary replacement during upgrade (no "file not found" after install)
 
 use log::{error, info, warn};
 use nix::errno::Errno;
 use nix::poll::{poll, PollFd, PollFlags};
 use std::os::unix::io::BorrowedFd;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -17,12 +22,16 @@ use std::time::Duration;
 use x11::keysym;
 use x11::xlib;
 
+// ─── Hotkey configuration ─────────────────────────────────────────────────────
+
 const CTRL_SHIFT_MASK: u32 = xlib::ControlMask | xlib::ShiftMask;
 
 /// Maximum time to wait for X display to become available (60 seconds).
-/// This handles the case where the daemon is started before the X server
-/// is ready (e.g. during early boot via systemd user service).
+/// Handles daemon started before X server is ready (e.g. early boot via
+/// systemd user service or XDG autostart with delay).
 const DISPLAY_WAIT_TIMEOUT_SECS: u64 = 60;
+
+// ─── X error tracking ────────────────────────────────────────────────────────
 
 /// Number of X errors delivered while registering the hotkey.
 /// XGrabKey() ALWAYS returns 1 (even on conflict) — the real result arrives
@@ -30,9 +39,8 @@ const DISPLAY_WAIT_TIMEOUT_SECS: u64 = 60;
 /// errors instead of trusting the return value.
 static X_ERRORS: AtomicUsize = AtomicUsize::new(0);
 
-/// Xlib's default error handler exits the process on ANY X error — including
-/// the expected `BadAccess` when Ctrl+Shift+S is already grabbed by another
-/// client. Count errors instead so we can report the conflict gracefully.
+/// Count X errors instead of letting Xlib's default handler exit(1).
+/// This lets us detect BadAccess (hotkey conflict) gracefully.
 extern "C" fn count_x_error(
     _display: *mut xlib::Display,
     error: *mut xlib::XErrorEvent,
@@ -47,10 +55,11 @@ extern "C" fn count_x_error(
     0
 }
 
+// ─── Error type ───────────────────────────────────────────────────────────────
+
 /// Error kinds so the caller can distinguish a hotkey conflict (another app
 /// already owns the key) from a real failure. A conflict is an expected
-/// condition — NOT an error that should trigger a restart loop under a
-/// process supervisor.
+/// condition — NOT an error that should trigger a restart loop.
 #[derive(Debug)]
 pub enum HotkeyError {
     Conflict,
@@ -68,37 +77,145 @@ impl std::fmt::Display for HotkeyError {
 
 impl std::error::Error for HotkeyError {}
 
+// ─── Executable resolver ──────────────────────────────────────────────────────
+
+/// Resolve the path to the MintShot executable for spawning `--capture`.
+///
+/// After an upgrade, `std::env::current_exe()` may point to a deleted binary
+/// because the daemon was started from the old binary before `install.sh`
+/// replaced it via mv. This function tries multiple fallback strategies:
+///
+///   1. `current_exe()` — works if binary wasn't replaced
+///   2. `argv[0]`       — works if daemon was started with absolute path
+///   3. Well-known install locations:
+///      - `~/.local/bin/mintshot`  (user install)
+///      - `/usr/bin/mintshot`      (system .deb install)
+///      - `/usr/local/bin/mintshot`
+///   4. `$PATH` lookup via `which`
+fn resolve_capture_executable() -> Result<PathBuf, String> {
+    // 1. Try current_exe() — most common case
+    if let Ok(path) = std::env::current_exe() {
+        // On Linux, current_exe() reads /proc/self/exe.
+        // After binary replacement, this may show "(deleted)" in readlink
+        // output, but the path itself may still be valid if the new binary
+        // is at the same location.
+        if path.exists() {
+            return Ok(path);
+        }
+
+        // The exe was replaced — try the same path without "(deleted)"
+        let path_str = path.to_string_lossy();
+        let cleaned = path_str.trim_end_matches(" (deleted)");
+        let cleaned_path = PathBuf::from(cleaned);
+        if cleaned_path.exists() {
+            info!("current_exe() was stale, using cleaned path: {}", cleaned);
+            return Ok(cleaned_path);
+        }
+
+        warn!(
+            "current_exe() points to missing path: {} — trying fallbacks",
+            path.display()
+        );
+    }
+
+    // 2. Try argv[0] — may be an absolute path
+    if let Some(arg0) = std::env::args().next() {
+        let p = PathBuf::from(&arg0);
+
+        // Absolute path
+        if p.is_absolute() && p.exists() {
+            info!("Resolved via argv[0]: {}", p.display());
+            return Ok(p);
+        }
+
+        // Relative path with directory component (e.g. ./target/release/mintshot)
+        if arg0.contains('/') {
+            if let Ok(abs) = std::fs::canonicalize(&p) {
+                if abs.exists() {
+                    info!("Resolved via argv[0] canonicalize: {}", abs.display());
+                    return Ok(abs);
+                }
+            }
+        }
+    }
+
+    // 3. Well-known install locations
+    let mut candidates = Vec::with_capacity(4);
+
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(PathBuf::from(&home).join(".local/bin/mintshot"));
+    }
+    candidates.push(PathBuf::from("/usr/bin/mintshot"));
+    candidates.push(PathBuf::from("/usr/local/bin/mintshot"));
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            info!("Resolved via known location: {}", candidate.display());
+            return Ok(candidate.clone());
+        }
+    }
+
+    // 4. Last resort: search $PATH
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("mintshot")
+        .output()
+    {
+        if output.status.success() {
+            let path_str = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_string();
+            if !path_str.is_empty() {
+                let p = PathBuf::from(&path_str);
+                if p.exists() {
+                    info!("Resolved via 'which': {}", p.display());
+                    return Ok(p);
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "Cannot find mintshot executable. Tried: current_exe, argv[0], {:?}, $PATH",
+        candidates
+    ))
+}
+
+// ─── Public entry point ───────────────────────────────────────────────────────
+
 /// Listen for the Ctrl+Shift+S global hotkey.
+///
+/// Blocks until `running` is set to false (via signal handler) or the
+/// X display connection is lost.
 pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
     // ─── Wait for X display to be available ───────────────────────────────
     let display = wait_for_display(DISPLAY_WAIT_TIMEOUT_SECS)
         .map_err(|e| HotkeyError::Other(e.to_string()))?;
 
     unsafe {
-        xlib::XSetErrorHandler(Some(count_x_error));
+        // Install our error counter (Fix #9: save previous handler)
+        let prev_handler = xlib::XSetErrorHandler(Some(count_x_error));
 
         let root = xlib::XDefaultRootWindow(display);
 
         // Get keycode for 'S'
         let keycode = xlib::XKeysymToKeycode(display, keysym::XK_s as u64);
         if keycode == 0 {
+            xlib::XSetErrorHandler(prev_handler);
             xlib::XCloseDisplay(display);
             return Err(HotkeyError::Other("Cannot get keycode for 'S'".into()));
         }
 
         info!("Registering hotkey Ctrl+Shift+S (keycode={})", keycode);
 
-        // Grab with all modifier combinations
+        // Grab with all modifier combinations (NumLock, CapsLock, both)
         let modifiers = [
             CTRL_SHIFT_MASK,
-            CTRL_SHIFT_MASK | xlib::Mod2Mask,
-            CTRL_SHIFT_MASK | xlib::LockMask,
-            CTRL_SHIFT_MASK | xlib::Mod2Mask | xlib::LockMask,
+            CTRL_SHIFT_MASK | xlib::Mod2Mask,                    // NumLock
+            CTRL_SHIFT_MASK | xlib::LockMask,                    // CapsLock
+            CTRL_SHIFT_MASK | xlib::Mod2Mask | xlib::LockMask,  // Both
         ];
 
-        // NOTE: XGrabKey() returns 1 whether it succeeded or conflicted, so we
-        // cannot trust its return value. Instead, reset the error counter, do
-        // all grabs, sync, then check how many BadAccess errors were delivered.
+        // Reset error counter, do all grabs, sync, then check for BadAccess.
         X_ERRORS.store(0, Ordering::Relaxed);
         for &modifier in &modifiers {
             xlib::XGrabKey(
@@ -113,14 +230,19 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
         }
         xlib::XSync(display, xlib::False);
 
+        // Restore previous error handler (Fix #9)
+        xlib::XSetErrorHandler(prev_handler);
+
+        // Check grab results
         let grab_errors = X_ERRORS.load(Ordering::Relaxed);
         if grab_errors > 0 {
             if grab_errors >= modifiers.len() {
+                // ALL grabs failed — another app owns Ctrl+Shift+S completely
                 xlib::XCloseDisplay(display);
                 return Err(HotkeyError::Conflict);
             }
             warn!(
-                "{} of {} hotkey combos are grabbed by another app — \
+                "{} of {} hotkey combos grabbed by another app — \
                  hotkey may not work with NumLock/CapsLock active",
                 grab_errors,
                 modifiers.len()
@@ -130,31 +252,34 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
         info!("✓ Global hotkey Ctrl+Shift+S registered successfully");
         info!("Daemon is ready. Press Ctrl+Shift+S to take a screenshot.");
 
+        // ─── Resolve capture executable once at startup ────────────────────
+        // Also re-resolve on spawn failure (handles upgrade mid-session).
+        let mut capture_exe = resolve_capture_executable().ok();
+        if let Some(ref exe) = capture_exe {
+            info!("Capture executable: {}", exe.display());
+        } else {
+            warn!("Could not resolve capture executable at startup — will retry on hotkey");
+        }
+
         // ─── Event loop ────────────────────────────────────────────────────
-        // Block on poll() instead of busy-sleeping. POLLHUP/POLLERR/POLLNVAL
-        // mean the X connection died (X server restarted / logged out) — the
-        // old check `XConnectionNumber < 0` could never fire, so the daemon
-        // used to hang forever in that case.
         let conn_fd = BorrowedFd::borrow_raw(xlib::XConnectionNumber(display));
         let mut event: xlib::XEvent = std::mem::zeroed();
 
         'event_loop: while running.load(Ordering::Relaxed) {
             let mut pfd = PollFd::new(&conn_fd, PollFlags::POLLIN);
 
-            // Xlib buffers data read from the socket internally. Events that
-            // arrived while we weren't in the loop (e.g. during XSync) may
-            // already be sitting in Xlib's queue, in which case the raw fd
-            // has no data and poll() would block forever, missing the hotkey.
-            // So if Xlib already has events queued, skip poll and drain them.
+            // Check Xlib internal queue FIRST — events may already be
+            // buffered from XSync, in which case poll() would block forever.
             let poll_result = if xlib::XEventsQueued(display, 0) > 0 {
                 Ok(1)
             } else {
-                poll(std::slice::from_mut(&mut pfd), 1000)
+                poll(std::slice::from_mut(&mut pfd), 1000) // 1s timeout
             };
 
             match poll_result {
-                // Timeout — loop around to re-check the running flag.
+                // Timeout — loop around to re-check running flag
                 Ok(0) => continue,
+
                 Ok(_) => {
                     let revents = pfd.revents().unwrap_or(PollFlags::empty());
                     if revents.intersects(
@@ -164,7 +289,7 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
                         break 'event_loop;
                     }
 
-                    // Drain all pending events, then go back to poll().
+                    // Drain all pending events
                     while xlib::XPending(display) > 0 {
                         xlib::XNextEvent(display, &mut event);
 
@@ -176,34 +301,18 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
                             if key_event.keycode == keycode as u32
                                 && clean_state == CTRL_SHIFT_MASK
                             {
-                                info!("🎯 Hotkey Ctrl+Shift+S detected — spawning capture...");
-
-                                match std::env::current_exe() {
-                                    Ok(exe) => {
-                                        match std::process::Command::new(&exe)
-                                            .arg("--capture")
-                                            .spawn()
-                                        {
-                                            Ok(child) => {
-                                                info!("Capture process spawned (pid {})",
-                                                      child.id());
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to spawn capture: {}", e);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Cannot get current exe path: {}", e);
-                                    }
-                                }
+                                info!(
+                                    "🎯 Hotkey Ctrl+Shift+S detected — spawning capture..."
+                                );
+                                spawn_capture(&mut capture_exe);
                             }
                         }
                     }
                 }
-                // Signal interrupted the wait (e.g. SIGINT/SIGTERM) — loop
-                // around so the running flag is re-checked for a clean exit.
+
+                // Signal interrupted poll (SIGINT/SIGTERM) — re-check running
                 Err(Errno::EINTR) => continue,
+
                 Err(e) => {
                     error!("poll() error: {} — exiting", e);
                     break 'event_loop;
@@ -211,7 +320,7 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
             }
         }
 
-        // Cleanup
+        // ─── Cleanup ───────────────────────────────────────────────────────
         info!("Cleaning up hotkey grabs...");
         for &modifier in &modifiers {
             xlib::XUngrabKey(display, keycode as i32, modifier, root);
@@ -223,18 +332,76 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
     Ok(())
 }
 
+// ─── Spawn capture subprocess ────────────────────────────────────────────────
+
+/// Spawn `mintshot --capture` as a child process.
+///
+/// If the cached executable path fails (e.g. binary was replaced during
+/// upgrade), re-resolves the path and retries once.
+fn spawn_capture(cached_exe: &mut Option<PathBuf>) {
+    // First attempt: use cached path
+    if let Some(ref exe) = cached_exe {
+        match std::process::Command::new(exe).arg("--capture").spawn() {
+            Ok(child) => {
+                info!("Capture process spawned (pid {})", child.id());
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    "Cached exe {} failed: {} — re-resolving...",
+                    exe.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    // Re-resolve and retry
+    match resolve_capture_executable() {
+        Ok(new_exe) => {
+            info!("Re-resolved capture exe: {}", new_exe.display());
+            match std::process::Command::new(&new_exe)
+                .arg("--capture")
+                .spawn()
+            {
+                Ok(child) => {
+                    info!("Capture process spawned (pid {})", child.id());
+                    // Update cache for next time
+                    *cached_exe = Some(new_exe);
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to spawn capture from {}: {}",
+                        new_exe.display(),
+                        e
+                    );
+                    *cached_exe = None;
+                }
+            }
+        }
+        Err(e) => {
+            error!("Cannot find mintshot executable: {}", e);
+            error!("Try reinstalling: bash install.sh");
+            *cached_exe = None;
+        }
+    }
+}
+
+// ─── Wait for X display ──────────────────────────────────────────────────────
+
 /// Wait for X display to become available, with exponential backoff.
 ///
 /// Returns the opened display pointer, or an error if timeout is reached.
 ///
-/// This is critical for systemd user service startup — the service may
+/// Critical for systemd user service or XDG autostart — the daemon may
 /// start before the X server is fully initialized.
-fn wait_for_display(timeout_secs: u64) -> Result<*mut xlib::Display, Box<dyn std::error::Error>> {
+fn wait_for_display(
+    timeout_secs: u64,
+) -> Result<*mut xlib::Display, Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
     let mut attempt = 0u32;
 
     loop {
-        // Check DISPLAY environment variable exists
         let display_env = std::env::var("DISPLAY").unwrap_or_default();
 
         if !display_env.is_empty() {
@@ -242,8 +409,11 @@ fn wait_for_display(timeout_secs: u64) -> Result<*mut xlib::Display, Box<dyn std
                 let display = xlib::XOpenDisplay(std::ptr::null());
                 if !display.is_null() {
                     if attempt > 0 {
-                        info!("✓ X display opened after {} attempts ({:?})",
-                              attempt + 1, start.elapsed());
+                        info!(
+                            "✓ X display opened after {} attempts ({:?})",
+                            attempt + 1,
+                            start.elapsed()
+                        );
                     } else {
                         info!("✓ X display opened: {}", display_env);
                     }
@@ -258,20 +428,21 @@ fn wait_for_display(timeout_secs: u64) -> Result<*mut xlib::Display, Box<dyn std
         if elapsed >= timeout_secs {
             return Err(format!(
                 "X display not available after {} seconds (attempts: {}). \
-                DISPLAY={}. Is the X server running?",
+                 DISPLAY={}. Is the X server running?",
                 timeout_secs, attempt, display_env
-            ).into());
+            )
+            .into());
         }
 
-        // Log periodically so user knows daemon is alive
+        // Log periodically (Fix #7: stable Rust — no is_multiple_of)
         if attempt == 1 {
             info!("Waiting for X display to become available...");
             info!("DISPLAY env: '{}'", display_env);
-} else if attempt % 10 == 0 {
+        } else if attempt % 10 == 0 {
             info!("Still waiting for X display... ({}s elapsed)", elapsed);
         }
 
-        // Exponential backoff: 100ms → 200ms → 400ms → ... → max 2s
+        // Exponential backoff: 100ms → 200ms → 400ms → … → max 2s
         let wait_ms = (100u64 * (1u64 << attempt.min(4))).min(2000);
         thread::sleep(Duration::from_millis(wait_ms));
     }
