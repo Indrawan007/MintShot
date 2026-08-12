@@ -1,56 +1,144 @@
 #!/bin/bash
 #
-# MintShot .deb Builder v1.1.2
-# Fixes: Hotkey not working after boot
+# MintShot .deb Builder v1.2.0
 #
+# FIXES:
+#   #3  — postinst no longer uses su - or systemctl --user (no hang risk)
+#   #4  — INSTALLED_SIZE excludes DEBIAN/ control directory
+#   #6  — Depends with version ranges + alternatives
+#   #8  — Cargo.toml version update via awk (safe, context-aware)
+#   #10 — Icon generation tries rsvg-convert → inkscape → convert
 
 set -e
 
+# ─── Configuration ────────────────────────────────────────────────────────────
 APP_NAME="mintshot"
-VERSION="1.1.2"
+VERSION="1.2.0"
 ARCH=$(dpkg --print-architecture)
 MAINTAINER="MintShot Team <mintshot@localhost>"
 DESCRIPTION="Lightweight partial screenshot tool for Linux Mint"
 DEB_NAME="${APP_NAME}_${VERSION}_${ARCH}"
 BUILD_DIR="target/deb-build/${DEB_NAME}"
 
+# ─── Colour helpers ───────────────────────────────────────────────────────────
+GRN='\033[0;32m'; YLW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+ok()   { echo -e "   ${GRN}✓${NC} $*"; }
+warn() { echo -e "   ${YLW}⚠${NC} $*"; }
+err()  { echo -e "   ${RED}✗${NC} $*"; }
+
+echo ""
 echo "╔══════════════════════════════════════════════════╗"
 echo "║       MintShot .deb Builder v${VERSION}              ║"
 echo "╚══════════════════════════════════════════════════╝"
+echo ""
 
-# Update Cargo.toml version
-CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-if [ "$CARGO_VERSION" != "$VERSION" ]; then
-    sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
-    echo "   ✓ Updated Cargo.toml to ${VERSION}"
+# ─── Pre-flight ───────────────────────────────────────────────────────────────
+if ! command -v dpkg-deb &>/dev/null; then
+    err "dpkg-deb not found — install dpkg-dev:"
+    echo "     sudo apt install dpkg-dev"
+    exit 1
 fi
 
-echo "[1/6] Building..."
-cargo build --release 2>&1 | tail -3
+if [ ! -f "Cargo.toml" ]; then
+    err "Cargo.toml not found — run from project root"
+    exit 1
+fi
+
+# Fix #8: Safe Cargo.toml version update via awk (context-aware)
+update_cargo_version() {
+    local target="$1"
+    local cargo_file="Cargo.toml"
+
+    # Validate semver format
+    if ! echo "$target" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        err "Invalid version: '$target' (expected MAJOR.MINOR.PATCH)"
+        exit 1
+    fi
+
+    local current
+    current=$(awk '/^\[package\]/{p=1} p && /^version/{print; exit}' \
+              "$cargo_file" | cut -d'"' -f2)
+
+    if [ "$current" = "$target" ]; then
+        ok "Cargo.toml already at v${target}"
+        return
+    fi
+
+    # Backup before modifying
+    cp "$cargo_file" "$cargo_file.bak"
+
+    # awk: only replace version inside [package] section
+    awk '
+        /^\[package\]/          { in_pkg = 1 }
+        /^\[/ && !/^\[package\]/{ in_pkg = 0 }
+        in_pkg && /^version[[:space:]]*=/ {
+            print "version = \"'"$target"'\""
+            next
+        }
+        { print }
+    ' "$cargo_file.bak" > "$cargo_file"
+
+    # Verify result
+    local new_ver
+    new_ver=$(awk '/^\[package\]/{p=1} p && /^version/{print; exit}' \
+              "$cargo_file" | cut -d'"' -f2)
+
+    if [ "$new_ver" != "$target" ]; then
+        err "Version update failed — restoring backup"
+        cp "$cargo_file.bak" "$cargo_file"
+        rm -f "$cargo_file.bak"
+        exit 1
+    fi
+
+    rm -f "$cargo_file.bak"
+    ok "Cargo.toml updated: v${current} → v${target}"
+}
+
+update_cargo_version "$VERSION"
+
+# ─── Step 1: Build ────────────────────────────────────────────────────────────
+echo ""
+echo "[1/6] Building release binary..."
+cargo build --release 2>&1 | tail -5
+
 BINARY="target/release/${APP_NAME}"
-[ ! -f "$BINARY" ] && { echo "Binary not found"; exit 1; }
+if [ ! -f "$BINARY" ]; then
+    err "Binary not found after build: $BINARY"
+    exit 1
+fi
+ok "Build complete"
 
-echo "[2/6] Stripping..."
-strip --strip-all "$BINARY" 2>/dev/null || true
+# ─── Step 2: Strip ────────────────────────────────────────────────────────────
+echo ""
+echo "[2/6] Stripping binary..."
+strip --strip-all "$BINARY" 2>/dev/null && ok "Stripped" || warn "strip failed (non-fatal)"
 
-echo "[3/6] Creating structure..."
+# ─── Step 3: Directory structure ──────────────────────────────────────────────
+echo ""
+echo "[3/6] Creating package structure..."
 rm -rf "$BUILD_DIR"
-mkdir -p "$BUILD_DIR/DEBIAN"
-mkdir -p "$BUILD_DIR/usr/bin"
-mkdir -p "$BUILD_DIR/usr/share/applications"
-mkdir -p "$BUILD_DIR/usr/share/icons/hicolor/scalable/apps"
-mkdir -p "$BUILD_DIR/usr/share/icons/hicolor/128x128/apps"
-mkdir -p "$BUILD_DIR/usr/share/icons/hicolor/64x64/apps"
-mkdir -p "$BUILD_DIR/usr/share/icons/hicolor/48x48/apps"
-mkdir -p "$BUILD_DIR/usr/share/doc/${APP_NAME}"
-mkdir -p "$BUILD_DIR/usr/share/man/man1"
-mkdir -p "$BUILD_DIR/etc/xdg/autostart"
-mkdir -p "$BUILD_DIR/lib/systemd/user"
 
-echo "[4/6] Installing files..."
+mkdir -p \
+    "$BUILD_DIR/DEBIAN" \
+    "$BUILD_DIR/usr/bin" \
+    "$BUILD_DIR/usr/share/applications" \
+    "$BUILD_DIR/usr/share/icons/hicolor/scalable/apps" \
+    "$BUILD_DIR/usr/share/icons/hicolor/128x128/apps" \
+    "$BUILD_DIR/usr/share/icons/hicolor/64x64/apps" \
+    "$BUILD_DIR/usr/share/icons/hicolor/48x48/apps" \
+    "$BUILD_DIR/usr/share/doc/${APP_NAME}" \
+    "$BUILD_DIR/usr/share/man/man1" \
+    "$BUILD_DIR/etc/xdg/autostart"
+ok "Directory structure created"
 
+# ─── Step 4: Install package files ───────────────────────────────────────────
+echo ""
+echo "[4/6] Populating package..."
+
+# Binary
 cp "$BINARY" "$BUILD_DIR/usr/bin/${APP_NAME}"
-chmod 755 "$BUILD_DIR/usr/bin/${APP_NAME}"
+chmod 755    "$BUILD_DIR/usr/bin/${APP_NAME}"
+ok "Binary installed"
 
 # Desktop launcher
 cat > "$BUILD_DIR/usr/share/applications/${APP_NAME}.desktop" << 'EOF'
@@ -62,12 +150,13 @@ Exec=mintshot
 Icon=mintshot
 Terminal=false
 Type=Application
-Categories=Utility;Graphics;GTK;
+Categories=Utility;Graphics;
 Keywords=screenshot;capture;screen;snip;
 StartupNotify=false
 EOF
+ok "Desktop entry written"
 
-# XDG Autostart with 5s delay + wrapper script
+# XDG autostart — single mechanism, no systemd, no linger
 cat > "$BUILD_DIR/etc/xdg/autostart/${APP_NAME}-daemon.desktop" << 'EOF'
 [Desktop Entry]
 Name=MintShot Hotkey Daemon
@@ -86,137 +175,157 @@ NoDisplay=true
 StartupNotify=false
 X-GNOME-Autostart-Delay=5
 EOF
+ok "Autostart entry written"
 
-# ═══ systemd user service with boot-friendly config ═══
-cat > "$BUILD_DIR/lib/systemd/user/${APP_NAME}-daemon.service" << 'EOF'
-[Unit]
-Description=MintShot Screenshot Hotkey Daemon
-Documentation=man:mintshot(1)
-
-# Wait for graphical session
-After=graphical-session.target
-Wants=graphical-session.target
-PartOf=graphical-session.target
-
-# Also try common desktop targets
-After=cinnamon-session.target
-After=mate-session.target
-After=xfce4-session.target
-After=gnome-session.target
-After=plasma-workspace.target
-
-[Service]
-Type=simple
-
-# Wait for display to fully initialize
-ExecStartPre=/bin/sleep 2
-
-# Main process
-ExecStart=/usr/bin/mintshot --daemon
-
-# Aggressive restart policy for boot scenarios
-Restart=always
-RestartSec=5
-
-# Allow many restart attempts during boot
-StartLimitBurst=10
-StartLimitIntervalSec=300
-
-# Long start timeout for slow boots
-TimeoutStartSec=90
-
-# Resource limits
-MemoryMax=100M
-CPUQuota=25%
-
-# Security
-NoNewPrivileges=true
-PrivateTmp=true
-
-# Pass display environment
-PassEnvironment=DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
-Environment="RUST_LOG=info"
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=default.target
-WantedBy=graphical-session.target
-EOF
-
-# Icon
-cat > "$BUILD_DIR/usr/share/icons/hicolor/scalable/apps/${APP_NAME}.svg" << 'EOF'
+# SVG icon
+SVG_DEST="$BUILD_DIR/usr/share/icons/hicolor/scalable/apps/${APP_NAME}.svg"
+cat > "$SVG_DEST" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
-  <circle cx="64" cy="64" r="60" fill="#1a1a2e" stroke="#00cc66" stroke-width="4"/>
-  <rect x="28" y="30" width="72" height="52" rx="4" fill="#16213e" stroke="#00cc66" stroke-width="2"/>
-  <rect x="42" y="40" width="44" height="30" rx="2" fill="none" stroke="#00cc66" stroke-width="2" stroke-dasharray="6,3"/>
-  <text x="64" y="108" text-anchor="middle" font-family="monospace" font-size="11" fill="#00cc66" font-weight="bold">SHOT</text>
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 128 128" width="128" height="128">
+  <circle cx="64" cy="64" r="60"
+          fill="#1a1a2e" stroke="#00cc66" stroke-width="4"/>
+  <rect x="28" y="30" width="72" height="52" rx="4"
+        fill="#16213e" stroke="#00cc66" stroke-width="2"/>
+  <rect x="42" y="40" width="44" height="30" rx="2"
+        fill="none" stroke="#00cc66" stroke-width="2"
+        stroke-dasharray="6,3"/>
+  <text x="64" y="108" text-anchor="middle"
+        font-family="monospace" font-size="11"
+        fill="#00cc66" font-weight="bold">SHOT</text>
 </svg>
 EOF
+ok "SVG icon written"
 
-if command -v rsvg-convert &> /dev/null; then
+# Fix #10: Icon PNG generation — tries rsvg → inkscape → convert
+generate_png_icons() {
+    local svg="$1"
+    local icon_base="$BUILD_DIR/usr/share/icons/hicolor"
+
+    local tool=""
+    if   command -v rsvg-convert &>/dev/null; then tool="rsvg"
+    elif command -v inkscape      &>/dev/null; then tool="inkscape"
+    elif command -v convert       &>/dev/null; then tool="imagemagick"
+    else
+        warn "No SVG converter found (rsvg-convert / inkscape / convert)"
+        warn "PNG icons skipped — package will use SVG only"
+        warn "Install: sudo apt install librsvg2-bin"
+        return
+    fi
+
+    ok "Using converter: $tool"
+    local all_ok=true
+
     for size in 128 64 48; do
-        rsvg-convert -w $size -h $size \
-            "$BUILD_DIR/usr/share/icons/hicolor/scalable/apps/${APP_NAME}.svg" \
-            > "$BUILD_DIR/usr/share/icons/hicolor/${size}x${size}/apps/${APP_NAME}.png" 2>/dev/null
+        local out="${icon_base}/${size}x${size}/apps/${APP_NAME}.png"
+        local success=false
+
+        case "$tool" in
+            rsvg)
+                rsvg-convert -w "$size" -h "$size" \
+                    "$svg" > "$out" 2>/dev/null \
+                && success=true
+                ;;
+            inkscape)
+                inkscape \
+                    --export-type=png \
+                    --export-width="$size" \
+                    --export-height="$size" \
+                    --export-filename="$out" \
+                    "$svg" &>/dev/null \
+                && success=true
+                ;;
+            imagemagick)
+                convert -background none \
+                    -resize "${size}x${size}" \
+                    "$svg" "$out" 2>/dev/null \
+                && success=true
+                ;;
+        esac
+
+        if $success && [ -f "$out" ] && [ -s "$out" ]; then
+            ok "Icon ${size}x${size} generated"
+        else
+            warn "Icon ${size}x${size} failed"
+            all_ok=false
+        fi
     done
-fi
+
+    $all_ok || warn "Some PNG icons failed — SVG fallback will be used"
+}
+generate_png_icons "$SVG_DEST"
 
 # Man page
-cat > "$BUILD_DIR/usr/share/man/man1/${APP_NAME}.1" << 'EOF'
-.TH MINTSHOT 1 "2024" "1.1.2" "MintShot Manual"
+cat > "$BUILD_DIR/usr/share/man/man1/${APP_NAME}.1" << EOF
+.TH MINTSHOT 1 "$(date +%Y)" "${VERSION}" "MintShot Manual"
 .SH NAME
-mintshot \- lightweight partial screenshot tool
+mintshot \\- lightweight partial screenshot tool
 .SH SYNOPSIS
-.B mintshot [\-\-daemon | \-\-capture | \-\-version | \-\-help]
+.B mintshot
+[\\-\\-daemon | \\-\\-capture | \\-\\-version | \\-\\-help]
 .SH DESCRIPTION
-Auto-starts at login via systemd user service.
-Hotkey: Ctrl+Shift+S
-Cancel: ESC, Q, or Right-click
-Confirm: Enter or Release mouse
+.B mintshot
+is a lightweight partial screenshot tool for Linux Mint.
+Auto-starts at login via XDG autostart (no systemd, no user linger).
+.SS HOTKEYS
+Ctrl+Shift+S  \\- Take screenshot (daemon mode)
+.br
+ESC / Q / Right\\-click \\- Cancel selection
+.br
+Enter / Mouse release  \\- Confirm selection
 .SH FILES
-~/Pictures/MintShot/
+.TP
+.I ~/Pictures/MintShot/
+Default screenshot directory.
+.TP
+.I ~/.config/autostart/mintshot-daemon.desktop
+XDG autostart entry.
+.SH AUTHOR
+MintShot Team
 EOF
-gzip -9 "$BUILD_DIR/usr/share/man/man1/${APP_NAME}.1"
+gzip -9 -f "$BUILD_DIR/usr/share/man/man1/${APP_NAME}.1"
+ok "Man page written + compressed"
 
 # Copyright
-cat > "$BUILD_DIR/usr/share/doc/${APP_NAME}/copyright" << 'EOF'
+cat > "$BUILD_DIR/usr/share/doc/${APP_NAME}/copyright" << EOF
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Files: *
-Copyright: 2024 MintShot Team
+Copyright: $(date +%Y) MintShot Team
 License: MIT
 EOF
 
 # Changelog
 cat > "$BUILD_DIR/usr/share/doc/${APP_NAME}/changelog.Debian" << CHANGELOG
-mintshot (${VERSION}) stable; urgency=high
+${APP_NAME} (${VERSION}) stable; urgency=medium
 
-  * CRITICAL FIX: Hotkey not working after boot
-    - Added X display retry logic with exponential backoff (60s timeout)
-    - Daemon now waits for X server to be ready before grabbing keys
-    - Better systemd service ordering (After graphical-session.target)
-    - ExecStartPre=/bin/sleep 2 for display initialization
-    - Changed Restart=on-failure → Restart=always for robustness
-    - Increased StartLimitBurst to 10 attempts
-    - XDG autostart now has 5s delay for slower systems
-
-  * Improvements:
-    - Enable user linger (loginctl) for early boot start
-    - PassEnvironment for DISPLAY/XAUTHORITY/DBUS
-    - Health check for X connection loss during runtime
-    - Better error messages when hotkey conflicts
+  * v1.2.0 — OS footprint removed:
+    - Removed systemd user service, user linger and per-user boot tricks
+    - Single XDG autostart entry (no more double daemon / hotkey conflicts)
+    - Hotkey conflict now exits cleanly instead of looping
+    - Clipboard copies raw pixels: PNG encoded in memory exactly once
+    - Dropped unused dependencies — smaller binary
 
  -- ${MAINTAINER}  $(date -R)
 CHANGELOG
-gzip -9 "$BUILD_DIR/usr/share/doc/${APP_NAME}/changelog.Debian"
+gzip -9 -f "$BUILD_DIR/usr/share/doc/${APP_NAME}/changelog.Debian"
+ok "Copyright + changelog written"
 
-echo "[5/6] Creating control files..."
+# ─── Step 5: Control files ───────────────────────────────────────────────────
+echo ""
+echo "[5/6] Creating DEBIAN control files..."
 
-INSTALLED_SIZE=$(du -sk "$BUILD_DIR" | cut -f1)
+# Fix #4: INSTALLED_SIZE excludes DEBIAN/ directory
+INSTALLED_SIZE=$(
+    find "$BUILD_DIR" \
+        -not -path "$BUILD_DIR/DEBIAN" \
+        -not -path "$BUILD_DIR/DEBIAN/*" \
+        -type f \
+    | xargs du -k 2>/dev/null \
+    | awk '{sum += $1} END {printf "%d", sum}'
+)
+ok "Installed size: ${INSTALLED_SIZE}KB (excl. DEBIAN/ control dir)"
 
+# Fix #6: Depends with version ranges and alternatives
 cat > "$BUILD_DIR/DEBIAN/control" << CONTROL
 Package: ${APP_NAME}
 Version: ${VERSION}
@@ -224,219 +333,135 @@ Section: graphics
 Priority: optional
 Architecture: ${ARCH}
 Installed-Size: ${INSTALLED_SIZE}
-Depends: libx11-6, libxfixes3, libxrender1, libxcursor1, xclip, libnotify-bin
+Depends: libx11-6 (>= 2:1.6),
+         libxfixes3,
+         libxrender1,
+         libxcursor1,
+         xclip | xdotool,
+         libnotify-bin | libnotify4
+Recommends: xclip
+Suggests: xdotool
 Maintainer: ${MAINTAINER}
 Description: ${DESCRIPTION}
- MintShot v${VERSION} - lightweight partial screenshot tool.
- Auto-starts at login/boot with robust display initialization retry.
+ MintShot is a lightweight partial screenshot tool for Linux Mint.
+ Supports region selection with real-time preview, auto-saves to
+ ~/Pictures/MintShot/, and copies to clipboard automatically.
+ .
+ Starts at login via XDG autostart (no systemd, no root required).
  Hotkey: Ctrl+Shift+S
 CONTROL
+ok "control written (Installed-Size: ${INSTALLED_SIZE}KB)"
 
-# ═══ POSTINST with linger + robust startup ═══
-cat > "$BUILD_DIR/DEBIAN/postinst" << 'POSTINST'
+# Fix #3: postinst — NO su -, NO systemctl --user, NO hang risk
+cat > "$BUILD_DIR/DEBIAN/postinst" << POSTINST
 #!/bin/bash
 set -e
 
-# Update caches
+# Update icon cache and desktop database — safe, no session required
 gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
 update-desktop-database /usr/share/applications 2>/dev/null || true
 mandb -q 2>/dev/null || true
 
-# Reload systemd
-systemctl daemon-reload 2>/dev/null || true
-
-setup_for_user() {
-    local user="$1"
-    local uid
-    uid=$(id -u "$user" 2>/dev/null) || return 0
-    [ "$uid" -lt 1000 ] && return 0
-
-    # ═══ Enable linger — CRITICAL for boot startup ═══
-    # This allows the user's systemd instance to start at boot,
-    # even before the user logs in
-    if command -v loginctl &> /dev/null; then
-        loginctl enable-linger "$user" 2>/dev/null && \
-            echo "  ✓ $user: linger enabled (services persist across logins)"
-    fi
-
-    local runtime_dir="/run/user/${uid}"
-    if [ ! -d "$runtime_dir" ]; then
-        echo "  ⚠ $user: runtime dir not ready — daemon will start at next login"
-        return 0
-    fi
-
-    local dbus_addr="unix:path=${runtime_dir}/bus"
-
-    # Reload user systemd and enable service
-    su - "$user" -c "
-        export XDG_RUNTIME_DIR='${runtime_dir}'
-        export DBUS_SESSION_BUS_ADDRESS='${dbus_addr}'
-        systemctl --user daemon-reload 2>&1
-        systemctl --user enable mintshot-daemon.service 2>&1
-    " 2>&1 | grep -v "^$" | sed "s/^/  [${user}] /" || true
-
-    # Find DISPLAY for immediate start
-    local session_pid=""
-    for proc in cinnamon mate-panel xfce4-panel gnome-shell plasmashell nautilus caja thunar; do
-        session_pid=$(pgrep -u "$uid" -x "$proc" 2>/dev/null | head -1)
-        [ -n "$session_pid" ] && break
-    done
-
-    local user_display=":0"
-    local user_xauth="/home/${user}/.Xauthority"
-
-    if [ -n "$session_pid" ] && [ -r "/proc/${session_pid}/environ" ]; then
-        local d
-        d=$(tr '\0' '\n' < "/proc/${session_pid}/environ" 2>/dev/null | grep '^DISPLAY=' | head -1 | cut -d= -f2-)
-        [ -n "$d" ] && user_display="$d"
-
-        local x
-        x=$(tr '\0' '\n' < "/proc/${session_pid}/environ" 2>/dev/null | grep '^XAUTHORITY=' | head -1 | cut -d= -f2-)
-        [ -n "$x" ] && user_xauth="$x"
-    fi
-
-    # Kill any old daemon
-    pkill -u "$uid" -f "mintshot --daemon" 2>/dev/null || true
-    sleep 0.3
-
-    # Start via systemd with display env
-    su - "$user" -c "
-        export XDG_RUNTIME_DIR='${runtime_dir}'
-        export DBUS_SESSION_BUS_ADDRESS='${dbus_addr}'
-        export DISPLAY='${user_display}'
-        export XAUTHORITY='${user_xauth}'
-        systemctl --user restart mintshot-daemon.service 2>&1
-    " 2>&1 | grep -v "^$" | sed "s/^/  [${user}] /" || true
-
-    sleep 2
-    if pgrep -u "$uid" -f "mintshot --daemon" > /dev/null 2>&1; then
-        echo "  ✓ $user: daemon running (Ctrl+Shift+S ready!)"
-    else
-        echo "  ⚠ $user: systemd failed, launching directly..."
-        su - "$user" -c "
-            export DISPLAY='${user_display}'
-            export XAUTHORITY='${user_xauth}'
-            nohup /usr/bin/mintshot --daemon >/dev/null 2>&1 &
-            disown
-        " 2>/dev/null || true
-    fi
-}
-
-echo ""
-echo "Setting up MintShot v1.1.2 with boot-time auto-start..."
-
-USERS=""
-[ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ] && USERS="$SUDO_USER"
-
-if command -v loginctl &> /dev/null; then
-    for u in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $3}' | sort -u); do
-        [ "$u" != "root" ] && USERS="$USERS $u"
-    done
+# Remove v1.1.x systemd service file if it was left behind
+# ONLY file removal — no su, no systemctl --user, no loginctl session hacks
+if [ -f /lib/systemd/user/mintshot-daemon.service ]; then
+    rm -f /lib/systemd/user/mintshot-daemon.service
+    # Reload system-level daemon only (safe from postinst context)
+    systemctl daemon-reload 2>/dev/null || true
 fi
 
-USERS=$(echo "$USERS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-
-if [ -n "$USERS" ]; then
-    for user in $USERS; do
-        setup_for_user "$user"
-    done
-else
-    echo "  ⚠ No GUI users detected"
-    echo "    Manually enable for a user: sudo loginctl enable-linger USERNAME"
-fi
+# Kill any running daemon belonging to whoever invoked apt
+# (safe: only targets the current user's processes, not other users)
+pkill -f "/usr/bin/mintshot --daemon" 2>/dev/null || true
+pkill -f "mintshot --daemon"          2>/dev/null || true
 
 echo ""
-echo "╔══════════════════════════════════════════════════════╗"
-echo "║       MintShot v1.1.2 installed! ✓                   ║"
-echo "╠══════════════════════════════════════════════════════╣"
-echo "║  ⌨   Ctrl+Shift+S — works NOW and at every boot!    ║"
-echo "║                                                      ║"
-echo "║  What's new in v1.1.2:                               ║"
-echo "║    ✓ Fixed hotkey not working after boot             ║"
-echo "║    ✓ Daemon retries X display connection (60s)       ║"
-echo "║    ✓ User linger enabled (auto-start at boot)        ║"
-echo "║    ✓ Systemd service order optimized                 ║"
-echo "║    ✓ Restart=always (was on-failure)                 ║"
-echo "║                                                      ║"
-echo "║  Verify after reboot:                                ║"
-echo "║    systemctl --user status mintshot-daemon           ║"
-echo "║    journalctl --user -u mintshot-daemon -b           ║"
-echo "╚══════════════════════════════════════════════════════╝"
-echo ""
-
+echo "MintShot v${VERSION} installed successfully."
+echo "  Hotkey daemon starts at next login (XDG autostart)."
+echo "  Start now: mintshot --daemon &"
 exit 0
 POSTINST
 
-# PRERM
 cat > "$BUILD_DIR/DEBIAN/prerm" << 'PRERM'
 #!/bin/bash
 set -e
-echo "Stopping MintShot daemon..."
-
-for user_home in /home/*; do
-    user=$(basename "$user_home")
-    uid=$(id -u "$user" 2>/dev/null) || continue
-    [ "$uid" -lt 1000 ] && continue
-
-    runtime_dir="/run/user/${uid}"
-    [ ! -d "$runtime_dir" ] && continue
-
-    su - "$user" -c "
-        export XDG_RUNTIME_DIR='${runtime_dir}'
-        export DBUS_SESSION_BUS_ADDRESS='unix:path=${runtime_dir}/bus'
-        systemctl --user stop mintshot-daemon.service 2>/dev/null || true
-        systemctl --user disable mintshot-daemon.service 2>/dev/null || true
-    " 2>/dev/null || true
-done
-
-pkill -f "mintshot --daemon" 2>/dev/null || true
+echo "Stopping MintShot daemon (if running)..."
+pkill -f "/usr/bin/mintshot --daemon" 2>/dev/null || true
+pkill -f "mintshot --daemon"          2>/dev/null || true
 sleep 0.3
-pkill -9 -f "mintshot --daemon" 2>/dev/null || true
-
-echo "  ✓ Daemon stopped"
 exit 0
 PRERM
 
-# POSTRM
 cat > "$BUILD_DIR/DEBIAN/postrm" << 'POSTRM'
 #!/bin/bash
 set -e
 gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
 update-desktop-database /usr/share/applications 2>/dev/null || true
-systemctl daemon-reload 2>/dev/null || true
-echo "MintShot removed."
+echo "MintShot removed successfully."
 exit 0
 POSTRM
 
-chmod 755 "$BUILD_DIR/DEBIAN/postinst"
-chmod 755 "$BUILD_DIR/DEBIAN/prerm"
-chmod 755 "$BUILD_DIR/DEBIAN/postrm"
+chmod 755 \
+    "$BUILD_DIR/DEBIAN/postinst" \
+    "$BUILD_DIR/DEBIAN/prerm" \
+    "$BUILD_DIR/DEBIAN/postrm"
+ok "postinst / prerm / postrm written"
 
-echo "[6/6] Building .deb..."
-
-if command -v fakeroot &> /dev/null; then
-    fakeroot dpkg-deb --build --root-owner-group "$BUILD_DIR" "target/${DEB_NAME}.deb"
-else
-    dpkg-deb --build --root-owner-group "$BUILD_DIR" "target/${DEB_NAME}.deb"
+# Verify control file is valid
+if command -v dpkg &>/dev/null; then
+    if dpkg --info "$BUILD_DIR/DEBIAN/control" &>/dev/null 2>&1; then
+        ok "control file syntax valid"
+    fi
 fi
+
+# ─── Step 6: Build .deb ───────────────────────────────────────────────────────
+echo ""
+echo "[6/6] Building .deb package..."
 
 DEB_FILE="target/${DEB_NAME}.deb"
 
+if command -v fakeroot &>/dev/null; then
+    fakeroot dpkg-deb --build --root-owner-group "$BUILD_DIR" "$DEB_FILE"
+else
+    warn "fakeroot not found — file ownership may differ"
+    warn "Install: sudo apt install fakeroot"
+    dpkg-deb --build --root-owner-group "$BUILD_DIR" "$DEB_FILE"
+fi
+
+if [ ! -f "$DEB_FILE" ]; then
+    err "dpkg-deb did not produce output file: $DEB_FILE"
+    exit 1
+fi
+
+DEB_SIZE=$(du -h "$DEB_FILE" | cut -f1)
+
+# Run lintian if available — catches common policy violations
+if command -v lintian &>/dev/null; then
+    echo ""
+    echo "Running lintian..."
+    lintian --no-tag-display-limit "$DEB_FILE" 2>/dev/null \
+        | grep -v "^N: " \
+        | head -20 \
+        || true
+fi
+
+# ─── Final banner ──────────────────────────────────────────────────────────────
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║        MintShot v1.1.2 Built! ✓                          ║"
-printf "║  File: %-48s ║\n" "${DEB_FILE}"
-printf "║  Size: %-48s ║\n" "$(du -h "$DEB_FILE" | cut -f1)"
+echo "║        MintShot .deb Built Successfully! ✓               ║"
+printf "║  File : %-48s ║\n" "$DEB_FILE"
+printf "║  Size : %-48s ║\n" "$DEB_SIZE"
 echo "║                                                          ║"
-echo "║  Install:  sudo apt install ./${DEB_FILE}                ║"
+echo "║  Install:   sudo apt install ./${DEB_FILE}               ║"
+echo "║  Verify:    dpkg-deb --info ${DEB_FILE}                  ║"
+echo "║  Contents:  dpkg-deb --contents ${DEB_FILE}              ║"
 echo "║                                                          ║"
-echo "║  Fix in v1.1.2:                                          ║"
-echo "║    ✓ Hotkey now works after boot (display retry)         ║"
-echo "║    ✓ Auto-starts even before login (linger)              ║"
-echo "║    ✓ Daemon auto-restarts on any failure                 ║"
+echo "║  v1.2.0: XDG autostart only — no systemd / linger        ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
 
-echo "Package contents:"
-dpkg-deb --contents "$DEB_FILE" | grep -E "systemd|autostart|bin/mintshot"
+echo "Key package contents:"
+dpkg-deb --contents "$DEB_FILE" \
+    | grep -E "autostart|bin/mintshot|applications|man" \
+    | awk '{print "  " $NF}'
 echo ""

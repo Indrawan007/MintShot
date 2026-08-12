@@ -13,6 +13,7 @@ Built with Rust for maximum performance and minimal resource usage.
 - 📋 **Auto Clipboard** - Screenshots copied automatically
 - 🖥️ **X11 Native** - No heavy GUI framework dependencies
 - 📁 **Auto Save** - ~/Pictures/MintShot/ with timestamps
+- 🛡️ **No OS Impact** - Per-user install, no root, no systemd, no linger
 
 ## Performance Comparison
 
@@ -29,8 +30,16 @@ Built with Rust for maximum performance and minimal resource usage.
 ## Installation
 
 ```bash
-# Install from source
+# Install from source (per-user — no root, no system changes)
 git clone <repo>
 cd mintshot
 chmod +x install.sh
 ./install.sh
+```
+
+`install.sh` installs everything under `~/.local/` + `~/.config/autostart/`.
+No root, no systemd service, no linger — the OS is never touched. Revert
+with `./uninstall.sh`.
+
+A system `.deb` is also available (self-contained package, cleanly
+removable via `apt remove mintshot`).

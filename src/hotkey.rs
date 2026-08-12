@@ -47,10 +47,32 @@ extern "C" fn count_x_error(
     0
 }
 
+/// Error kinds so the caller can distinguish a hotkey conflict (another app
+/// already owns the key) from a real failure. A conflict is an expected
+/// condition — NOT an error that should trigger a restart loop under a
+/// process supervisor.
+#[derive(Debug)]
+pub enum HotkeyError {
+    Conflict,
+    Other(String),
+}
+
+impl std::fmt::Display for HotkeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict => write!(f, "hotkey already in use by another application"),
+            Self::Other(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for HotkeyError {}
+
 /// Listen for the Ctrl+Shift+S global hotkey.
-pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
     // ─── Wait for X display to be available ───────────────────────────────
-    let display = wait_for_display(DISPLAY_WAIT_TIMEOUT_SECS)?;
+    let display = wait_for_display(DISPLAY_WAIT_TIMEOUT_SECS)
+        .map_err(|e| HotkeyError::Other(e.to_string()))?;
 
     unsafe {
         xlib::XSetErrorHandler(Some(count_x_error));
@@ -61,7 +83,7 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), Box<dyn std::error:
         let keycode = xlib::XKeysymToKeycode(display, keysym::XK_s as u64);
         if keycode == 0 {
             xlib::XCloseDisplay(display);
-            return Err("Cannot get keycode for 'S'".into());
+            return Err(HotkeyError::Other("Cannot get keycode for 'S'".into()));
         }
 
         info!("Registering hotkey Ctrl+Shift+S (keycode={})", keycode);
@@ -95,10 +117,7 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), Box<dyn std::error:
         if grab_errors > 0 {
             if grab_errors >= modifiers.len() {
                 xlib::XCloseDisplay(display);
-                return Err(
-                    "Failed to grab hotkey Ctrl+Shift+S — another app already has it bound"
-                        .into(),
-                );
+                return Err(HotkeyError::Conflict);
             }
             warn!(
                 "{} of {} hotkey combos are grabbed by another app — \
@@ -122,7 +141,18 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), Box<dyn std::error:
         'event_loop: while running.load(Ordering::Relaxed) {
             let mut pfd = PollFd::new(&conn_fd, PollFlags::POLLIN);
 
-            match poll(std::slice::from_mut(&mut pfd), 1000) {
+            // Xlib buffers data read from the socket internally. Events that
+            // arrived while we weren't in the loop (e.g. during XSync) may
+            // already be sitting in Xlib's queue, in which case the raw fd
+            // has no data and poll() would block forever, missing the hotkey.
+            // So if Xlib already has events queued, skip poll and drain them.
+            let poll_result = if xlib::XEventsQueued(display, 0) > 0 {
+                Ok(1)
+            } else {
+                poll(std::slice::from_mut(&mut pfd), 1000)
+            };
+
+            match poll_result {
                 // Timeout — loop around to re-check the running flag.
                 Ok(0) => continue,
                 Ok(_) => {
@@ -237,7 +267,7 @@ fn wait_for_display(timeout_secs: u64) -> Result<*mut xlib::Display, Box<dyn std
         if attempt == 1 {
             info!("Waiting for X display to become available...");
             info!("DISPLAY env: '{}'", display_env);
-        } else if attempt.is_multiple_of(10) {
+} else if attempt % 10 == 0 {
             info!("Still waiting for X display... ({}s elapsed)", elapsed);
         }
 

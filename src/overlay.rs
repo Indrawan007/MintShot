@@ -1,17 +1,26 @@
 //! Fullscreen translucent overlay for region selection
 //!
 //! UX Features:
-//! - Smooth dim overlay (~30% opacity simulation)
+//! - Smooth dim overlay (proper 8x8 stipple pattern)
 //! - Help text instructions on screen
 //! - Real-time mouse coordinates
 //! - Crosshair guides that persist during drag
 //! - Selection with thick border + corner handles
 //! - Dimension + position info panel
 //! - Edge guide lines during selection
-//! - ESC / Right-click to cancel
+//! - ESC / Right-click / Q to cancel
 //! - Left click + drag to select, release to confirm
+//! - Click without drag = ignored (user can try again)
+//!
+//! FIXES:
+//!   #1  — XDestroyImage setelah pixels di-copy (no use-after-free)
+//!   #2  — RAII guard untuk semua X11 resources (no leak on early return)
+//!   #3  — Click tanpa drag tidak menutup overlay
+//!   #6  — Stipple pattern 8x8 yang proper
+//!   #9  — XSetErrorHandler di-restore setelah selesai
+//!   #12 — XTextWidth untuk font measurement yang akurat
 
-use log::info;
+use log::{info, warn};
 use std::error::Error;
 use std::ptr;
 use x11::keysym;
@@ -19,29 +28,37 @@ use x11::xlib;
 
 use crate::selection::SelectionRect;
 
-// ─── Visual constants ─────────────────────────────────────────────────────────
+// ─── Visual constants ──────────────────────────────────────────────────────
 
-const SEL_BORDER_COLOR: u64  = 0x00_CC_66;
+const SEL_BORDER_COLOR:  u64 = 0x00_CC_66;
 const SEL_BORDER_SHADOW: u64 = 0x00_00_00;
-const CORNER_COLOR: u64      = 0xFF_FF_FF;
-const CORNER_SIZE: i32       = 8;
-const BORDER_WIDTH: u32      = 2;
-const GUIDE_COLOR: u64       = 0xFF_FF_FF;
-const EDGE_GUIDE_COLOR: u64  = 0x80_80_80;
-const PANEL_BG: u64          = 0x1A_1A_2E;
-const PANEL_TEXT: u64         = 0xFF_FF_FF;
-const PANEL_ACCENT: u64      = 0x00_CC_66;
-const PANEL_DIM_TEXT: u64    = 0xAA_AA_AA;
-const HELP_BG: u64           = 0x16_16_28;
-const HELP_TEXT: u64         = 0xCC_CC_CC;
-const HELP_KEY_BG: u64      = 0x33_33_55;
-const HELP_KEY_TEXT: u64     = 0xFF_FF_FF;
-const XC_CROSSHAIR: u32     = 34;
+const CORNER_COLOR:      u64 = 0xFF_FF_FF;
+const CORNER_SIZE:       i32 = 8;
+const BORDER_WIDTH:      u32 = 2;
+const GUIDE_COLOR:       u64 = 0xFF_FF_FF;
+const EDGE_GUIDE_COLOR:  u64 = 0x80_80_80;
+const PANEL_BG:          u64 = 0x1A_1A_2E;
+const PANEL_TEXT:        u64 = 0xFF_FF_FF;
+const PANEL_ACCENT:      u64 = 0x00_CC_66;
+const PANEL_DIM_TEXT:    u64 = 0xAA_AA_AA;
+const HELP_BG:           u64 = 0x16_16_28;
+const HELP_TEXT:         u64 = 0xCC_CC_CC;
+const HELP_KEY_BG:       u64 = 0x33_33_55;
+const HELP_KEY_TEXT:     u64 = 0xFF_FF_FF;
+const XC_CROSSHAIR:      u32 = 34;
 
-/// Xlib's default error handler calls exit(1) on ANY X error (e.g. a
-/// transient BadMatch/BadDrawable during grab races or drawing), which would
-/// kill the capture without cleanup. Ignore errors instead — we own the
-/// overlay window and validate everything we draw.
+// ─── Font candidates ───────────────────────────────────────────────────────
+
+const FONT_CANDIDATES: [&str; 3] = [
+    "-*-fixed-bold-r-*-*-13-*-*-*-*-*-iso8859-1",
+    "-*-*-*-r-*-*-13-*",
+    "fixed",
+];
+
+// ─── Error handler ─────────────────────────────────────────────────────────
+
+/// Silent error handler — prevent Xlib default exit(1) on transient errors.
+/// We own the overlay window and validate everything we draw.
 extern "C" fn ignore_x_error(
     _display: *mut xlib::Display,
     _error: *mut xlib::XErrorEvent,
@@ -49,15 +66,78 @@ extern "C" fn ignore_x_error(
     0
 }
 
-/// Candidate fonts, tried in order. The final "fixed" font is guaranteed to
-/// exist on every X server, so this effectively cannot fail.
-const FONT_CANDIDATES: [&str; 3] = [
-    "-*-fixed-bold-r-*-*-13-*-*-*-*-*-iso8859-1",
-    "-*-*-*-r-*-*-13-*",
-    "fixed",
-];
+// ─── RAII Guard (Fix #2) ───────────────────────────────────────────────────
 
-// ─── Drag state ───────────────────────────────────────────────────────────────
+/// RAII wrapper that guarantees ALL X11 resources are freed,
+/// even when early returns or panics occur.
+struct XOverlayGuard {
+    display:          *mut xlib::Display,
+    win:              Option<xlib::Window>,
+    gc:               Option<xlib::GC>,
+    cursor_font:      Option<xlib::Cursor>,
+    font:             Option<*mut xlib::XFontStruct>,
+    /// All pixmaps to free: [buf, bg_clean, bg_dim]
+    pixmaps:          Vec<xlib::Pixmap>,
+    bg_image:         Option<*mut xlib::XImage>,
+    pointer_grabbed:  bool,
+    keyboard_grabbed: bool,
+}
+
+impl XOverlayGuard {
+    fn new(display: *mut xlib::Display) -> Self {
+        Self {
+            display,
+            win:              None,
+            gc:               None,
+            cursor_font:      None,
+            font:             None,
+            pixmaps:          Vec::with_capacity(3),
+            bg_image:         None,
+            pointer_grabbed:  false,
+            keyboard_grabbed: false,
+        }
+    }
+}
+
+impl Drop for XOverlayGuard {
+    fn drop(&mut self) {
+        unsafe {
+            // Ungrab input first — always safe to call even if not grabbed
+            if self.pointer_grabbed {
+                xlib::XUngrabPointer(self.display, xlib::CurrentTime);
+            }
+            if self.keyboard_grabbed {
+                xlib::XUngrabKeyboard(self.display, xlib::CurrentTime);
+            }
+            if let Some(c) = self.cursor_font {
+                xlib::XFreeCursor(self.display, c);
+            }
+            if let Some(f) = self.font {
+                if !f.is_null() {
+                    xlib::XFreeFont(self.display, f);
+                }
+            }
+            if let Some(gc) = self.gc {
+                xlib::XFreeGC(self.display, gc);
+            }
+            for &pm in &self.pixmaps {
+                xlib::XFreePixmap(self.display, pm);
+            }
+            // ✅ Fix #1: bg_image freed AFTER pixels Vec<u8> already built
+            // Drop order: guard drops AFTER the Result is returned,
+            // so CaptureResult.pixels is safe
+            if let Some(img) = self.bg_image {
+                xlib::XDestroyImage(img);
+            }
+            if let Some(w) = self.win {
+                xlib::XDestroyWindow(self.display, w);
+            }
+            xlib::XFlush(self.display);
+        }
+    }
+}
+
+// ─── Drag state ────────────────────────────────────────────────────────────
 
 struct DragState {
     active:  bool,
@@ -76,48 +156,49 @@ impl DragState {
         self.start_y = y;
     }
 
+    fn reset(&mut self) {
+        self.active = false;
+    }
+
     fn to_selection(&self, end_x: i32, end_y: i32) -> SelectionRect {
         SelectionRect::from_points(self.start_x, self.start_y, end_x, end_y)
     }
 }
 
-// ─── Cursor position ──────────────────────────────────────────────────────────
+// ─── Cursor position ───────────────────────────────────────────────────────
 
 struct CursorPos {
     x: i32,
     y: i32,
 }
 
-// ─── Result from overlay ──────────────────────────────────────────────────────
+// ─── Public result type ────────────────────────────────────────────────────
 
-/// Contains both the selection rectangle AND the raw screen pixel data
-/// captured BEFORE the overlay was shown.
+/// Contains both the selection rectangle AND the raw RGBA pixel data
+/// captured BEFORE the overlay was shown — guaranteed clean, no artifacts.
 pub struct CaptureResult {
     pub selection: SelectionRect,
-    pub pixels: Vec<u8>,   // RGBA pixels of selected region
+    pub pixels:    Vec<u8>,
 }
 
-// ─── Public entry point ───────────────────────────────────────────────────────
+// ─── Public entry point ────────────────────────────────────────────────────
 
-/// Show overlay, get selection, AND return cropped pixels from the
-/// pre-overlay screenshot. This guarantees clean pixels without
-/// any overlay artifacts.
 pub fn show_selection_overlay(
-    display: *mut xlib::Display,
-    root: xlib::Window,
-    screen_width: u32,
+    display:       *mut xlib::Display,
+    root:          xlib::Window,
+    screen_width:  u32,
     screen_height: u32,
 ) -> Result<CaptureResult, Box<dyn Error>> {
     unsafe { run_overlay(display, root, screen_width, screen_height) }
 }
 
-// ─── Main overlay logic ──────────────────────────────────────────────────────
+// ─── Main overlay logic ────────────────────────────────────────────────────
 
 unsafe fn run_overlay(
     display: *mut xlib::Display,
-    root: xlib::Window,
-    sw: u32,
-    sh: u32,
+    root:    xlib::Window,
+    sw:      u32,
+    sh:      u32,
 ) -> Result<CaptureResult, Box<dyn Error>> {
 
     let screen   = xlib::XDefaultScreen(display);
@@ -125,27 +206,32 @@ unsafe fn run_overlay(
     let depth    = xlib::XDefaultDepth(display, screen);
     let colormap = xlib::XDefaultColormap(display, screen);
 
-    // ─── Pre-compute keycodes for reliable key detection ──────────────────
+    // ── Pre-compute keycodes ───────────────────────────────────────────────
     let escape_keycode = xlib::XKeysymToKeycode(display, keysym::XK_Escape as u64);
-    let q_keycode      = xlib::XKeysymToKeycode(display, keysym::XK_q as u64);
+    let q_keycode      = xlib::XKeysymToKeycode(display, keysym::XK_q      as u64);
     let return_keycode = xlib::XKeysymToKeycode(display, keysym::XK_Return as u64);
 
-    info!("Key mappings: ESC={}, Q={}, Enter={}",
+    info!("Key mappings — ESC: {}, Q: {}, Enter: {}",
           escape_keycode, q_keycode, return_keycode);
 
-    // ─── Capture screen BEFORE overlay ─────────────────────────────────────
+    // ── Capture screen BEFORE overlay ─────────────────────────────────────
     let bg = xlib::XGetImage(
         display, root, 0, 0, sw, sh,
         xlib::XAllPlanes(), xlib::ZPixmap,
     );
     if bg.is_null() {
-        return Err("Failed to capture background".into());
+        return Err("XGetImage failed — cannot capture background".into());
     }
 
-    // Prevent Xlib's default error handler from killing the process.
-    xlib::XSetErrorHandler(Some(ignore_x_error));
+    // ── Install silent error handler (Fix #9: save previous) ──────────────
+    let prev_handler = xlib::XSetErrorHandler(Some(ignore_x_error));
 
-    // ─── Create overlay window ─────────────────────────────────────────────
+    // ── RAII guard — owns ALL resources from this point on ────────────────
+    // Any `?` or early `return` will trigger Drop → guaranteed cleanup.
+    let mut guard = XOverlayGuard::new(display);
+    guard.bg_image = Some(bg); // guard now owns bg
+
+    // ── Create overlay window ──────────────────────────────────────────────
     let mut attrs: xlib::XSetWindowAttributes = std::mem::zeroed();
     attrs.override_redirect = xlib::True;
     attrs.event_mask        = xlib::ExposureMask
@@ -155,18 +241,18 @@ unsafe fn run_overlay(
         | xlib::KeyPressMask
         | xlib::KeyReleaseMask
         | xlib::FocusChangeMask;
-    attrs.colormap          = colormap;
-    attrs.background_pixel  = 0;
+    attrs.colormap         = colormap;
+    attrs.background_pixel = 0;
 
     let win = xlib::XCreateWindow(
         display, root, 0, 0, sw, sh, 0, depth,
         xlib::InputOutput as u32, visual,
         xlib::CWOverrideRedirect | xlib::CWEventMask
-            | xlib::CWColormap | xlib::CWBackPixel,
+            | xlib::CWColormap   | xlib::CWBackPixel,
         &mut attrs,
     );
+    guard.win = Some(win);
 
-    // Explicitly select KeyPress events (redundant but safe)
     xlib::XSelectInput(
         display, win,
         xlib::ExposureMask
@@ -181,105 +267,98 @@ unsafe fn run_overlay(
     xlib::XMapRaised(display, win);
     xlib::XSync(display, xlib::False);
 
-    // ─── Grab pointer with retry ───────────────────────────────────────────
+    // ── Grab pointer with retry ────────────────────────────────────────────
     let cursor_font = xlib::XCreateFontCursor(display, XC_CROSSHAIR);
+    guard.cursor_font = Some(cursor_font);
 
-    let mut grab_attempts = 0;
+    let mut attempts = 0u32;
     loop {
-        let result = xlib::XGrabPointer(
+        let r = xlib::XGrabPointer(
             display, win, xlib::True,
-            (xlib::ButtonPressMask | xlib::ButtonReleaseMask
+            (xlib::ButtonPressMask
+                | xlib::ButtonReleaseMask
                 | xlib::PointerMotionMask) as u32,
             xlib::GrabModeAsync, xlib::GrabModeAsync,
             win, cursor_font, xlib::CurrentTime,
         );
-
-        if result == xlib::GrabSuccess {
-            info!("Pointer grabbed successfully");
+        if r == xlib::GrabSuccess {
+            guard.pointer_grabbed = true;
+            info!("Pointer grabbed");
             break;
         }
-
-        grab_attempts += 1;
-        if grab_attempts > 20 {
-            // Don't continue without a pointer grab — the event loop would
-            // block forever waiting for events that never arrive.
-            xlib::XFreeCursor(display, cursor_font);
-            xlib::XDestroyWindow(display, win);
-            xlib::XDestroyImage(bg);
+        attempts += 1;
+        if attempts > 20 {
+            // guard.drop() will clean up win, cursor, bg_image
             return Err(
-                "Failed to grab pointer after retries — another app may be holding a grab".into(),
+                "Failed to grab pointer after 20 retries — \
+                 another app may be holding a grab".into(),
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
-    // ─── Grab keyboard with retry (CRITICAL for ESC) ───────────────────────
-    grab_attempts = 0;
+    // ── Grab keyboard with retry ───────────────────────────────────────────
+    attempts = 0;
     loop {
-        let result = xlib::XGrabKeyboard(
+        let r = xlib::XGrabKeyboard(
             display, win, xlib::True,
             xlib::GrabModeAsync, xlib::GrabModeAsync,
             xlib::CurrentTime,
         );
-
-        if result == xlib::GrabSuccess {
-            info!("Keyboard grabbed successfully");
+        if r == xlib::GrabSuccess {
+            guard.keyboard_grabbed = true;
+            info!("Keyboard grabbed");
             break;
         }
-
-        grab_attempts += 1;
-        if grab_attempts > 20 {
-            xlib::XFreeCursor(display, cursor_font);
-            xlib::XUngrabPointer(display, xlib::CurrentTime);
-            xlib::XDestroyWindow(display, win);
-            xlib::XDestroyImage(bg);
-            return Err("Failed to grab keyboard after retries".into());
+        attempts += 1;
+        if attempts > 20 {
+            return Err("Failed to grab keyboard after 20 retries".into());
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
-    // Force input focus to our window
     xlib::XSetInputFocus(display, win, xlib::RevertToParent, xlib::CurrentTime);
     xlib::XSync(display, xlib::False);
 
-    // ─── Create GC & pixmap buffers ────────────────────────────────────────
+    // ── Create GC + pixmap buffers ─────────────────────────────────────────
     let gc  = xlib::XCreateGC(display, win, 0, ptr::null_mut());
-    let buf = xlib::XCreatePixmap(display, win, sw, sh, depth as u32);
+    guard.gc = Some(gc);
 
-    // Try the font candidates in order until one loads.
+    let buf      = xlib::XCreatePixmap(display, win, sw, sh, depth as u32);
+    let bg_clean = xlib::XCreatePixmap(display, win, sw, sh, depth as u32);
+    let bg_dim   = xlib::XCreatePixmap(display, win, sw, sh, depth as u32);
+    // Push in REVERSE destroy order (buf last — used most)
+    guard.pixmaps.extend_from_slice(&[bg_clean, bg_dim, buf]);
+
+    // ── Load font (Fix #12: used for accurate XTextWidth later) ───────────
     let mut font: *mut xlib::XFontStruct = ptr::null_mut();
     for name in FONT_CANDIDATES {
-        let font_name = std::ffi::CString::new(name).unwrap();
-        let f = xlib::XLoadQueryFont(display, font_name.as_ptr());
+        let cname = std::ffi::CString::new(name).unwrap();
+        let f = xlib::XLoadQueryFont(display, cname.as_ptr());
         if !f.is_null() {
             font = f;
             xlib::XSetFont(display, gc, (*font).fid);
             break;
         }
     }
+    guard.font = Some(font);
 
-    // ─── Cache background pixmaps (built ONCE, reused every frame) ────────
-    // Previously every mouse-move redrew the whole screen by pushing the
-    // full XImage over the socket (XPutImage ≈ 8MB for 1080p). Now the
-    // background is uploaded once into two server-side pixmaps and each
-    // frame only does fast server-side XCopyArea blits.
-    let bg_clean = xlib::XCreatePixmap(display, win, sw, sh, depth as u32);
-    let bg_dim   = xlib::XCreatePixmap(display, win, sw, sh, depth as u32);
+    // ── Upload background pixmaps (once, server-side) ─────────────────────
     xlib::XPutImage(display, bg_clean, gc, bg, 0, 0, 0, 0, sw, sh);
     xlib::XCopyArea(display, bg_clean, bg_dim, gc, 0, 0, sw, sh, 0, 0);
     draw_dim_overlay(display, bg_dim, gc, sw, sh);
     xlib::XSync(display, xlib::False);
 
     // Initial draw
-    full_redraw(display, buf, gc, bg_clean, bg_dim, sw, sh, None, None);
+    full_redraw(display, buf, gc, bg_clean, bg_dim, sw, sh, font, None, None);
     blit(display, buf, win, gc, sw, sh);
     xlib::XFlush(display);
 
-    // ─── Event loop ───────────────────────────────────────────────────────
-    let mut event: xlib::XEvent              = std::mem::zeroed();
-    let mut drag                              = DragState::new();
-    let mut cursor: Option<CursorPos>         = None;
-    let mut result_sel: Option<SelectionRect> = None;
+    // ── Event loop ─────────────────────────────────────────────────────────
+    let mut event:      xlib::XEvent              = std::mem::zeroed();
+    let mut drag                                   = DragState::new();
+    let mut cursor:     Option<CursorPos>          = None;
+    let mut result_sel: Option<SelectionRect>      = None;
 
     'event_loop: loop {
         xlib::XNextEvent(display, &mut event);
@@ -290,19 +369,21 @@ unsafe fn run_overlay(
                 blit(display, buf, win, gc, sw, sh);
             }
 
-            // ── Focus events (log for debug) ──────────────────────────────
+            // ── Focus ─────────────────────────────────────────────────────
             xlib::FocusIn => {
-                info!("Window gained focus");
+                info!("Overlay gained focus");
             }
             xlib::FocusOut => {
-                info!("Window lost focus — re-grabbing keyboard");
-                // Re-grab keyboard if focus is lost
+                info!("Overlay lost focus — re-grabbing keyboard");
                 xlib::XGrabKeyboard(
                     display, win, xlib::True,
                     xlib::GrabModeAsync, xlib::GrabModeAsync,
                     xlib::CurrentTime,
                 );
-                xlib::XSetInputFocus(display, win, xlib::RevertToParent, xlib::CurrentTime);
+                xlib::XSetInputFocus(
+                    display, win,
+                    xlib::RevertToParent, xlib::CurrentTime,
+                );
             }
 
             // ── Button Press ──────────────────────────────────────────────
@@ -311,8 +392,8 @@ unsafe fn run_overlay(
                 match btn.button {
                     1 => drag.begin(btn.x, btn.y),
                     3 => {
-                        info!("Right click — cancelling");
-                        break 'event_loop;
+                        info!("Right-click — cancelling");
+                        break 'event_loop; // result_sel stays None → cancel
                     }
                     _ => {}
                 }
@@ -320,6 +401,7 @@ unsafe fn run_overlay(
 
             // ── Motion Notify ─────────────────────────────────────────────
             xlib::MotionNotify => {
+                // Drain motion queue — only latest position matters
                 let mut mx = event.motion.x;
                 let mut my = event.motion.y;
                 while xlib::XCheckMaskEvent(
@@ -335,9 +417,10 @@ unsafe fn run_overlay(
                 }
 
                 let sel = drag.active.then(|| drag.to_selection(mx, my));
-
-                full_redraw(display, buf, gc, bg_clean, bg_dim, sw, sh,
-                            sel.as_ref(), cursor.as_ref());
+                full_redraw(
+                    display, buf, gc, bg_clean, bg_dim,
+                    sw, sh, font, sel.as_ref(), cursor.as_ref(),
+                );
                 blit(display, buf, win, gc, sw, sh);
                 xlib::XFlush(display);
             }
@@ -347,33 +430,52 @@ unsafe fn run_overlay(
                 let btn = event.button;
                 if btn.button == 1 && drag.active {
                     let sel = drag.to_selection(btn.x, btn.y);
+                    drag.reset();
+
                     if sel.is_valid() {
+                        // ✅ Fix #3: only break when valid selection
                         result_sel = Some(sel);
+                        break 'event_loop;
+                    } else {
+                        // Selection too small — let user try again
+                        warn!(
+                            "Selection too small ({}x{}) — ignoring, \
+                             user can try again",
+                            sel.width, sel.height
+                        );
+                        // Redraw clean state
+                        full_redraw(
+                            display, buf, gc, bg_clean, bg_dim,
+                            sw, sh, font, None, cursor.as_ref(),
+                        );
+                        blit(display, buf, win, gc, sw, sh);
+                        xlib::XFlush(display);
                     }
-                    break 'event_loop;
                 }
             }
 
-            // ── Key Press (ROBUST HANDLING) ───────────────────────────────
+            // ── Key Press ─────────────────────────────────────────────────
             xlib::KeyPress => {
                 let key_event = event.key;
-                let keycode = key_event.keycode;
+                let keycode   = key_event.keycode;
 
                 log::debug!("KeyPress: keycode={}", keycode);
 
-                // Method 1: Check by keycode (most reliable)
-                if keycode == escape_keycode as u32 || keycode == q_keycode as u32 {
-                    info!("Cancel key detected (keycode match)");
+                // Method 1: keycode match (most reliable)
+                if keycode == escape_keycode as u32
+                    || keycode == q_keycode as u32
+                {
+                    info!("Cancel key (keycode {})", keycode);
                     break 'event_loop;
                 }
 
-                // Method 2: Check via keysym (backup)
+                // Method 2: keysym match (backup)
                 let sym = xlib::XLookupKeysym(&mut event.key, 0);
                 if sym == keysym::XK_Escape as u64
                     || sym == keysym::XK_q as u64
                     || sym == keysym::XK_Q as u64
                 {
-                    info!("Cancel key detected (keysym match): 0x{:x}", sym);
+                    info!("Cancel key (keysym 0x{:x})", sym);
                     break 'event_loop;
                 }
 
@@ -397,108 +499,99 @@ unsafe fn run_overlay(
         }
     }
 
-    // Ensure X11 is fully synced
     xlib::XSync(display, xlib::False);
 
-    // ─── Extract clean pixels ─────────────────────────────────────────────
-    // Clamp the selection to screen bounds FIRST so the returned rectangle
-    // always matches the extracted pixel buffer. Without this, a drag that
-    // ends off-screen produces a mismatched width/height vs. pixel count and
-    // a corrupted PNG.
-    let result: Option<CaptureResult> = result_sel.and_then(|sel| {
+    // ── Extract pixels BEFORE guard drops (Fix #1) ────────────────────────
+    // pixels is Vec<u8> — owned heap data, independent of XImage memory.
+    // After this line, guard.drop() can safely XDestroyImage(bg).
+    let capture_result: Option<CaptureResult> = result_sel.and_then(|sel| {
         let sel = sel.clamped_to(sw, sh);
         if !sel.is_valid() {
             return None;
         }
+        // bg is still valid here — guard hasn't dropped yet
         let pixels = extract_region_from_ximage(bg, &sel);
-        info!("Extracted {} bytes for {}x{} region",
-              pixels.len(), sel.width, sel.height);
+        info!(
+            "Extracted {} bytes for {}x{} region",
+            pixels.len(), sel.width, sel.height
+        );
         Some(CaptureResult { selection: sel, pixels })
     });
 
-    // ─── Cleanup ───────────────────────────────────────────────────────────
-    xlib::XUngrabPointer(display, xlib::CurrentTime);
-    xlib::XUngrabKeyboard(display, xlib::CurrentTime);
-    xlib::XFreeCursor(display, cursor_font);
-    if !font.is_null() { xlib::XFreeFont(display, font); }
-    xlib::XFreeGC(display, gc);
-    xlib::XFreePixmap(display, bg_clean);
-    xlib::XFreePixmap(display, bg_dim);
-    xlib::XFreePixmap(display, buf);
-    xlib::XDestroyImage(bg);
-    xlib::XDestroyWindow(display, win);
-    xlib::XFlush(display);
+    // ── Restore previous X error handler (Fix #9) ─────────────────────────
+    xlib::XSetErrorHandler(prev_handler);
 
-    result.ok_or_else(|| "Selection cancelled".into())
+    // guard drops here → XUngrabPointer, XUngrabKeyboard, XFreeCursor,
+    // XFreeFont, XFreeGC, XFreePixmap x3, XDestroyImage, XDestroyWindow,
+    // XFlush — all in correct order, guaranteed.
+
+    capture_result.ok_or_else(|| "Selection cancelled".into())
 }
 
-// ─── Extract clean pixels from XImage ─────────────────────────────────────────
+// ─── Extract pixels from XImage ───────────────────────────────────────────
 
-/// Crop a region from the pre-captured XImage and convert to RGBA.
-///
-/// Handles X11's various pixel formats:
-///   - 32-bit BGRA (most common on modern X11)
-///   - 32-bit BGRX (alpha byte is garbage/zero → force to 255)
-///   - 24-bit BGR
-///
-/// Uses the XImage's red/green/blue masks to correctly extract channels
-/// regardless of the display's byte order or pixel format.
 unsafe fn extract_region_from_ximage(
     image: *mut xlib::XImage,
-    sel: &SelectionRect,
+    sel:   &SelectionRect,
 ) -> Vec<u8> {
-    let img = &*image;
-    let total_px = (sel.width * sel.height) as usize;
-    let mut pixels = Vec::with_capacity(total_px * 4);
-
+    let img  = &*image;
     let data = img.data as *const u8;
-    let bytes_per_line = img.bytes_per_line as usize;
-    let bpp = (img.bits_per_pixel / 8) as usize;
 
-    // Get channel masks from XImage — these tell us where R/G/B bits are
+    let bytes_per_line = img.bytes_per_line as usize;
+    let bpp            = (img.bits_per_pixel / 8) as usize;
+
     let red_mask   = img.red_mask   as u32;
     let green_mask = img.green_mask as u32;
     let blue_mask  = img.blue_mask  as u32;
 
-    // Calculate bit shifts for each channel
     let red_shift   = mask_shift(red_mask);
     let green_shift = mask_shift(green_mask);
     let blue_shift  = mask_shift(blue_mask);
 
     log::info!(
-        "XImage format: bpp={}, R=0x{:08X} (shift {}), G=0x{:08X} (shift {}), B=0x{:08X} (shift {})",
-        img.bits_per_pixel, red_mask, red_shift,
-        green_mask, green_shift, blue_mask, blue_shift
+        "XImage — bpp={}, R=0x{:06X}(>>{}), G=0x{:06X}(>>{}), B=0x{:06X}(>>{})",
+        img.bits_per_pixel,
+        red_mask,   red_shift,
+        green_mask, green_shift,
+        blue_mask,  blue_shift,
     );
 
-    // Clamp selection to image bounds
-    let img_w = img.width as u32;
+    // Clamp to image bounds
+    let img_w = img.width  as u32;
     let img_h = img.height as u32;
     let sel_x = sel.x.min(img_w.saturating_sub(1));
     let sel_y = sel.y.min(img_h.saturating_sub(1));
-    let sel_w = sel.width.min(img_w.saturating_sub(sel_x));
+    let sel_w = sel.width .min(img_w.saturating_sub(sel_x));
     let sel_h = sel.height.min(img_h.saturating_sub(sel_y));
 
-    // ─── Fast path: standard 32-bit RGBX (memory bytes are B,G,R,X) ────────
-    // The most common layout on X11: 8 bits per channel, blue in the lowest
-    // byte. Just swap bytes — no per-pixel shift/mask work.
-    if bpp == 4 && red_mask == 0xFF_00_00 && green_mask == 0xFF_00 && blue_mask == 0xFF {
+    let mut pixels = Vec::with_capacity((sel_w * sel_h * 4) as usize);
+
+    // ── Fast path: 32-bit BGRA (most common on X11) ───────────────────────
+    if bpp == 4
+        && red_mask   == 0x00_FF_00_00
+        && green_mask == 0x00_00_FF_00
+        && blue_mask  == 0x00_00_00_FF
+    {
         for y in 0..sel_h as usize {
             let row = (sel_y as usize + y) * bytes_per_line;
             let src = data.add(row + sel_x as usize * 4);
             for x in 0..sel_w as usize {
                 let p = src.add(x * 4);
-                pixels.push(*p.add(2)); // R
-                pixels.push(*p.add(1)); // G
-                pixels.push(*p.add(0)); // B
-                pixels.push(255);
+                pixels.push(*p.add(2)); // R (byte 2)
+                pixels.push(*p.add(1)); // G (byte 1)
+                pixels.push(*p.add(0)); // B (byte 0)
+                pixels.push(255);       // A
             }
         }
         return pixels;
     }
 
-    // ─── Fast path: standard 24-bit BGR (memory bytes are B,G,R) ───────────
-    if bpp == 3 && red_mask == 0xFF_00_00 && green_mask == 0xFF_00 && blue_mask == 0xFF {
+    // ── Fast path: 24-bit BGR ─────────────────────────────────────────────
+    if bpp == 3
+        && red_mask   == 0x00_FF_00_00
+        && green_mask == 0x00_00_FF_00
+        && blue_mask  == 0x00_00_00_FF
+    {
         for y in 0..sel_h as usize {
             let row = (sel_y as usize + y) * bytes_per_line;
             let src = data.add(row + sel_x as usize * 3);
@@ -513,42 +606,32 @@ unsafe fn extract_region_from_ximage(
         return pixels;
     }
 
+    // ── Generic path: mask-based extraction ──────────────────────────────
     for y in 0..sel_h as usize {
-        let src_y = sel_y as usize + y;
-        let row = src_y * bytes_per_line;
-
+        let row = (sel_y as usize + y) * bytes_per_line;
         for x in 0..sel_w as usize {
-            let src_x = sel_x as usize + x;
-            let off = row + src_x * bpp;
+            let off = row + (sel_x as usize + x) * bpp;
 
-            // Read pixel as u32 (little-endian on all common platforms)
             let pixel: u32 = if bpp == 4 {
-                (*data.add(off) as u32)
+                (*data.add(off)     as u32)
                     | ((*data.add(off + 1) as u32) << 8)
                     | ((*data.add(off + 2) as u32) << 16)
                     | ((*data.add(off + 3) as u32) << 24)
             } else if bpp == 3 {
-                (*data.add(off) as u32)
+                (*data.add(off)     as u32)
                     | ((*data.add(off + 1) as u32) << 8)
                     | ((*data.add(off + 2) as u32) << 16)
             } else {
-                // Fallback: read as much as we can
-                let mut p: u32 = 0;
+                let mut p = 0u32;
                 for i in 0..bpp.min(4) {
                     p |= (*data.add(off + i) as u32) << (i * 8);
                 }
                 p
             };
 
-            // Extract channels using masks
-            let r = ((pixel & red_mask)   >> red_shift)   as u8;
-            let g = ((pixel & green_mask) >> green_shift) as u8;
-            let b = ((pixel & blue_mask)  >> blue_shift)  as u8;
-
-            // Always force alpha to 255 — root window has no alpha channel
-            pixels.push(r);
-            pixels.push(g);
-            pixels.push(b);
+            pixels.push(((pixel & red_mask)   >> red_shift)   as u8);
+            pixels.push(((pixel & green_mask)  >> green_shift) as u8);
+            pixels.push(((pixel & blue_mask)   >> blue_shift)  as u8);
             pixels.push(255);
         }
     }
@@ -556,72 +639,85 @@ unsafe fn extract_region_from_ximage(
     pixels
 }
 
-/// Calculate the right-shift needed to move the mask's LSB to bit 0
+/// Calculate right-shift to move mask LSB to bit 0
 fn mask_shift(mask: u32) -> u32 {
-    if mask == 0 {
-        return 0;
-    }
-    let mut shift = 0u32;
+    if mask == 0 { return 0; }
+    let mut s = 0u32;
     let mut m = mask;
-    while m & 1 == 0 {
-        shift += 1;
-        m >>= 1;
-    }
-    shift
+    while m & 1 == 0 { s += 1; m >>= 1; }
+    s
 }
 
-// ─── Full redraw ──────────────────────────────────────────────────────────────
+// ─── Accurate font measurement (Fix #12) ──────────────────────────────────
+
+/// Measure text width using XTextWidth if font is loaded,
+/// otherwise fall back to 7px-per-char estimate.
+unsafe fn measure_text(font: *mut xlib::XFontStruct, text: &str) -> i32 {
+    if font.is_null() || text.is_empty() {
+        return text.len() as i32 * 7;
+    }
+    let c = std::ffi::CString::new(text).unwrap_or_default();
+    xlib::XTextWidth(font, c.as_ptr(), text.len() as i32)
+}
+
+// ─── Full redraw ──────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn full_redraw(
-    display: *mut xlib::Display,
-    buf: xlib::Pixmap,
-    gc: xlib::GC,
-    bg_clean: xlib::Pixmap,
-    bg_dim: xlib::Pixmap,
-    sw: u32,
-    sh: u32,
+    display:   *mut xlib::Display,
+    buf:       xlib::Pixmap,
+    gc:        xlib::GC,
+    bg_clean:  xlib::Pixmap,
+    bg_dim:    xlib::Pixmap,
+    sw:        u32,
+    sh:        u32,
+    font:      *mut xlib::XFontStruct,
     selection: Option<&SelectionRect>,
-    cursor: Option<&CursorPos>,
+    cursor:    Option<&CursorPos>,
 ) {
-    // Server-side copy of the pre-dimmed background — no pixel data over the socket.
+    // Server-side blit of dimmed background — no pixel data over socket
     xlib::XCopyArea(display, bg_dim, buf, gc, 0, 0, sw, sh, 0, 0);
 
     match selection {
         Some(sel) if sel.is_valid() => {
-            draw_selection(display, buf, gc, bg_clean, sw, sh, sel, cursor);
+            draw_selection(display, buf, gc, bg_clean, sw, sh, font, sel, cursor);
         }
         _ => {
             if let Some(c) = cursor {
                 draw_crosshair_guides(display, buf, gc, c, sw, sh);
-                draw_coord_tooltip(display, buf, gc, c, sw, sh);
+                draw_coord_tooltip(display, buf, gc, font, c, sw, sh);
             }
         }
     }
 
-    draw_help_bar(display, buf, gc, sw, selection.is_some());
+    draw_help_bar(display, buf, gc, font, sw, selection.is_some());
 }
 
-// ─── Dim overlay ──────────────────────────────────────────────────────────────
+// ─── Dim overlay (Fix #6: proper 8x8 stipple) ────────────────────────────
 
 unsafe fn draw_dim_overlay(
     display: *mut xlib::Display,
-    buf: xlib::Pixmap,
-    gc: xlib::GC,
-    sw: u32,
-    sh: u32,
+    buf:     xlib::Pixmap,
+    gc:      xlib::GC,
+    sw:      u32,
+    sh:      u32,
 ) {
-    let stipple_data: [u8; 4] = [
-        0b1000_1000,
-        0b0010_0010,
-        0b1000_1000,
-        0b0010_0010,
+    // ✅ Fix #6: 8x8 checkerboard — tiles perfectly, no visible seams
+    let stipple_data: [u8; 8] = [
+        0b1010_1010,
+        0b0101_0101,
+        0b1010_1010,
+        0b0101_0101,
+        0b1010_1010,
+        0b0101_0101,
+        0b1010_1010,
+        0b0101_0101,
     ];
 
     let stipple = xlib::XCreateBitmapFromData(
         display, buf,
         stipple_data.as_ptr() as *const i8,
-        8, 4,
+        8, 8, // ← was 8x4, now correct 8x8
     );
 
     xlib::XSetFillStyle(display, gc, xlib::FillStippled);
@@ -632,52 +728,49 @@ unsafe fn draw_dim_overlay(
     xlib::XFreePixmap(display, stipple);
 }
 
-// ─── Selection drawing ───────────────────────────────────────────────────────
+// ─── Selection drawing ────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_selection(
-    display: *mut xlib::Display,
-    buf: xlib::Pixmap,
-    gc: xlib::GC,
+    display:  *mut xlib::Display,
+    buf:      xlib::Pixmap,
+    gc:       xlib::GC,
     bg_clean: xlib::Pixmap,
-    sw: u32,
-    sh: u32,
-    sel: &SelectionRect,
-    cursor: Option<&CursorPos>,
+    sw:       u32,
+    sh:       u32,
+    font:     *mut xlib::XFontStruct,
+    sel:      &SelectionRect,
+    cursor:   Option<&CursorPos>,
 ) {
     let sx = sel.x as i32;
     let sy = sel.y as i32;
+    let sw_i = sw as i32;
+    let sh_i = sh as i32;
 
-    // Edge guides
+    // Edge guides (dashed lines to screen edges)
     xlib::XSetForeground(display, gc, EDGE_GUIDE_COLOR);
     xlib::XSetLineAttributes(display, gc, 1,
         xlib::LineOnOffDash, xlib::CapButt, xlib::JoinMiter);
 
-    xlib::XDrawLine(display, buf, gc, sx, 0, sx, sy);
-    xlib::XDrawLine(display, buf, gc, sx + sel.width as i32, 0,
-                    sx + sel.width as i32, sy);
-    xlib::XDrawLine(display, buf, gc, sx, sy + sel.height as i32,
-                    sx, sh as i32);
-    xlib::XDrawLine(display, buf, gc, sx + sel.width as i32,
-                    sy + sel.height as i32,
-                    sx + sel.width as i32, sh as i32);
-    xlib::XDrawLine(display, buf, gc, 0, sy, sx, sy);
-    xlib::XDrawLine(display, buf, gc, 0, sy + sel.height as i32,
-                    sx, sy + sel.height as i32);
-    xlib::XDrawLine(display, buf, gc, sx + sel.width as i32, sy,
-                    sw as i32, sy);
-    xlib::XDrawLine(display, buf, gc, sx + sel.width as i32,
-                    sy + sel.height as i32,
-                    sw as i32, sy + sel.height as i32);
+    let ex = sx + sel.width as i32;
+    let ey = sy + sel.height as i32;
+
+    xlib::XDrawLine(display, buf, gc, sx, 0,    sx,   sy);
+    xlib::XDrawLine(display, buf, gc, ex, 0,    ex,   sy);
+    xlib::XDrawLine(display, buf, gc, sx, ey,   sx,   sh_i);
+    xlib::XDrawLine(display, buf, gc, ex, ey,   ex,   sh_i);
+    xlib::XDrawLine(display, buf, gc, 0,  sy,   sx,   sy);
+    xlib::XDrawLine(display, buf, gc, 0,  ey,   sx,   ey);
+    xlib::XDrawLine(display, buf, gc, ex, sy,   sw_i, sy);
+    xlib::XDrawLine(display, buf, gc, ex, ey,   sw_i, ey);
 
     xlib::XSetLineAttributes(display, gc, 1,
         xlib::LineSolid, xlib::CapButt, xlib::JoinMiter);
 
-    // Restore clear pixels from the cached pre-overlay pixmap (server-side copy)
+    // Restore clean background for selected region (server-side)
     xlib::XCopyArea(
         display, bg_clean, buf, gc,
-        sx, sy, sel.width, sel.height,
-        sx, sy,
+        sx, sy, sel.width, sel.height, sx, sy,
     );
 
     // Shadow border
@@ -692,7 +785,10 @@ unsafe fn draw_selection(
         xlib::LineSolid, xlib::CapButt, xlib::JoinMiter);
     xlib::XDrawRectangle(display, buf, gc, sx, sy, sel.width, sel.height);
 
-    // Corner handles
+    // Reset line width
+    xlib::XSetLineAttributes(display, gc, 1,
+        xlib::LineSolid, xlib::CapButt, xlib::JoinMiter);
+
     draw_corner_handles(display, buf, gc, sel);
 
     // Crosshair inside selection during drag
@@ -700,43 +796,43 @@ unsafe fn draw_selection(
         xlib::XSetForeground(display, gc, GUIDE_COLOR);
         xlib::XSetLineAttributes(display, gc, 1,
             xlib::LineOnOffDash, xlib::CapButt, xlib::JoinMiter);
-        xlib::XDrawLine(display, buf, gc, sx, c.y,
-                        sx + sel.width as i32, c.y);
-        xlib::XDrawLine(display, buf, gc, c.x, sy,
-                        c.x, sy + sel.height as i32);
+        xlib::XDrawLine(display, buf, gc, sx, c.y, ex, c.y);
+        xlib::XDrawLine(display, buf, gc, c.x, sy, c.x, ey);
         xlib::XSetLineAttributes(display, gc, 1,
             xlib::LineSolid, xlib::CapButt, xlib::JoinMiter);
     }
 
-    // Info panel
-    draw_info_panel(display, buf, gc, sel, sh);
+    draw_info_panel(display, buf, gc, font, sel, sh);
 }
 
-// ─── Corner handles ──────────────────────────────────────────────────────────
+// ─── Corner handles ───────────────────────────────────────────────────────
 
 unsafe fn draw_corner_handles(
     display: *mut xlib::Display,
-    buf: xlib::Pixmap,
-    gc: xlib::GC,
-    sel: &SelectionRect,
+    buf:     xlib::Pixmap,
+    gc:      xlib::GC,
+    sel:     &SelectionRect,
 ) {
-    let sx = sel.x as i32;
-    let sy = sel.y as i32;
-    let ex = sx + sel.width as i32;
-    let ey = sy + sel.height as i32;
+    let sx   = sel.x as i32;
+    let sy   = sel.y as i32;
+    let ex   = sx + sel.width  as i32;
+    let ey   = sy + sel.height as i32;
     let half = CORNER_SIZE / 2;
+    let mid_x = sx + sel.width  as i32 / 2;
+    let mid_y = sy + sel.height as i32 / 2;
 
     let corners = [
-        (sx - half, sy - half),
-        (ex - half, sy - half),
-        (sx - half, ey - half),
-        (ex - half, ey - half),
-        (sx + sel.width as i32 / 2 - half, sy - half),
-        (sx + sel.width as i32 / 2 - half, ey - half),
-        (sx - half, sy + sel.height as i32 / 2 - half),
-        (ex - half, sy + sel.height as i32 / 2 - half),
+        (sx   - half, sy   - half), // top-left
+        (ex   - half, sy   - half), // top-right
+        (sx   - half, ey   - half), // bottom-left
+        (ex   - half, ey   - half), // bottom-right
+        (mid_x - half, sy  - half), // top-mid
+        (mid_x - half, ey  - half), // bottom-mid
+        (sx   - half, mid_y - half),// left-mid
+        (ex   - half, mid_y - half),// right-mid
     ];
 
+    // Shadow
     xlib::XSetForeground(display, gc, SEL_BORDER_SHADOW);
     for (cx, cy) in &corners {
         xlib::XFillRectangle(display, buf, gc,
@@ -744,6 +840,7 @@ unsafe fn draw_corner_handles(
             (CORNER_SIZE + 2) as u32, (CORNER_SIZE + 2) as u32);
     }
 
+    // Fill
     xlib::XSetForeground(display, gc, CORNER_COLOR);
     for (cx, cy) in &corners {
         xlib::XFillRectangle(display, buf, gc,
@@ -752,69 +849,79 @@ unsafe fn draw_corner_handles(
     }
 }
 
-// ─── Crosshair guides ────────────────────────────────────────────────────────
+// ─── Crosshair guides ─────────────────────────────────────────────────────
 
 unsafe fn draw_crosshair_guides(
     display: *mut xlib::Display,
-    buf: xlib::Pixmap,
-    gc: xlib::GC,
-    c: &CursorPos,
-    sw: u32,
-    sh: u32,
+    buf:     xlib::Pixmap,
+    gc:      xlib::GC,
+    c:       &CursorPos,
+    sw:      u32,
+    sh:      u32,
 ) {
     xlib::XSetForeground(display, gc, GUIDE_COLOR);
     xlib::XSetLineAttributes(display, gc, 1,
         xlib::LineOnOffDash, xlib::CapButt, xlib::JoinMiter);
-    xlib::XDrawLine(display, buf, gc, 0, c.y, sw as i32, c.y);
-    xlib::XDrawLine(display, buf, gc, c.x, 0, c.x, sh as i32);
+    xlib::XDrawLine(display, buf, gc, 0,        c.y, sw as i32, c.y);
+    xlib::XDrawLine(display, buf, gc, c.x, 0,   c.x, sh as i32);
     xlib::XSetLineAttributes(display, gc, 1,
         xlib::LineSolid, xlib::CapButt, xlib::JoinMiter);
 }
 
-// ─── Coordinate tooltip ──────────────────────────────────────────────────────
+// ─── Coordinate tooltip (Fix #12: XTextWidth) ────────────────────────────
 
 unsafe fn draw_coord_tooltip(
     display: *mut xlib::Display,
-    buf: xlib::Pixmap,
-    gc: xlib::GC,
-    c: &CursorPos,
-    sw: u32,
-    sh: u32,
+    buf:     xlib::Pixmap,
+    gc:      xlib::GC,
+    font:    *mut xlib::XFontStruct,
+    c:       &CursorPos,
+    sw:      u32,
+    sh:      u32,
 ) {
-    let text = format!("{}, {}", c.x, c.y);
+    let text   = format!("{}, {}", c.x, c.y);
     let c_text = std::ffi::CString::new(text.as_str()).unwrap();
-    let text_w = (text.len() as i32) * 7 + 12;
+    // ✅ Fix #12: accurate measurement
+    let text_w = measure_text(font, &text) + 12;
     let text_h: i32 = 20;
-    let pad = 15;
+    let pad: i32    = 15;
 
-    let tx = if c.x + pad + text_w < sw as i32 { c.x + pad } else { c.x - pad - text_w };
-    let ty = if c.y + pad + text_h < sh as i32 { c.y + pad } else { c.y - pad - text_h };
+    let tx = if c.x + pad + text_w < sw as i32 { c.x + pad }
+             else { c.x - pad - text_w };
+    let ty = if c.y + pad + text_h < sh as i32 { c.y + pad }
+             else { c.y - pad - text_h };
 
     xlib::XSetForeground(display, gc, PANEL_BG);
     xlib::XFillRectangle(display, buf, gc, tx, ty, text_w as u32, text_h as u32);
     xlib::XSetForeground(display, gc, 0x33_33_55);
     xlib::XDrawRectangle(display, buf, gc, tx, ty, text_w as u32, text_h as u32);
     xlib::XSetForeground(display, gc, PANEL_DIM_TEXT);
-    xlib::XDrawString(display, buf, gc, tx + 6, ty + 14,
-                      c_text.as_ptr(), text.len() as i32);
+    xlib::XDrawString(display, buf, gc,
+        tx + 6, ty + 14, c_text.as_ptr(), text.len() as i32);
 }
 
-// ─── Info panel ──────────────────────────────────────────────────────────────
+// ─── Info panel (Fix #12: XTextWidth) ────────────────────────────────────
 
 unsafe fn draw_info_panel(
     display: *mut xlib::Display,
-    buf: xlib::Pixmap,
-    gc: xlib::GC,
-    sel: &SelectionRect,
-    sh: u32,
+    buf:     xlib::Pixmap,
+    gc:      xlib::GC,
+    font:    *mut xlib::XFontStruct,
+    sel:     &SelectionRect,
+    sh:      u32,
 ) {
-    let panel_w: u32 = 280;
+    let line1  = format!(" {}  ×  {} px", sel.width, sel.height);
+    let line2  = format!(" Position: ({}, {})", sel.x, sel.y);
+
+    // ✅ Fix #12: panel width based on actual text width
+    let content_w = measure_text(font, &line1)
+        .max(measure_text(font, &line2));
+    let panel_w  = (content_w + 50).max(240) as u32;
     let panel_h: u32 = 52;
     let margin: i32  = 8;
 
     let px = ((sel.x as i32 + sel.width as i32 / 2) - panel_w as i32 / 2)
         .max(margin);
-
     let py = if sel.y + sel.height + panel_h + 12 < sh {
         (sel.y + sel.height) as i32 + 10
     } else {
@@ -826,36 +933,33 @@ unsafe fn draw_info_panel(
     xlib::XSetForeground(display, gc, 0x33_33_55);
     xlib::XDrawRectangle(display, buf, gc, px, py, panel_w, panel_h);
 
-    let line1 = format!(" {}  x  {} px", sel.width, sel.height);
+    // Icon + dimension text
     let c_line1 = std::ffi::CString::new(line1.as_str()).unwrap();
-
     xlib::XSetForeground(display, gc, PANEL_ACCENT);
-    xlib::XFillRectangle(display, buf, gc, px + 10, py + 8, 12, 12);
+    xlib::XFillRectangle(display, buf, gc, px + 10, py + 8,  12, 12);
     xlib::XSetForeground(display, gc, PANEL_BG);
-    xlib::XFillRectangle(display, buf, gc, px + 13, py + 11, 6, 6);
-
+    xlib::XFillRectangle(display, buf, gc, px + 13, py + 11,  6,  6);
     xlib::XSetForeground(display, gc, PANEL_TEXT);
-    xlib::XDrawString(display, buf, gc, px + 26, py + 18,
-                      c_line1.as_ptr(), line1.len() as i32);
+    xlib::XDrawString(display, buf, gc,
+        px + 26, py + 18, c_line1.as_ptr(), line1.len() as i32);
 
-    let line2 = format!(" Position: ({}, {})", sel.x, sel.y);
+    // Icon + position text
     let c_line2 = std::ffi::CString::new(line2.as_str()).unwrap();
-
     xlib::XSetForeground(display, gc, PANEL_ACCENT);
-    xlib::XFillRectangle(display, buf, gc, px + 14, py + 31, 4, 4);
-
+    xlib::XFillRectangle(display, buf, gc, px + 14, py + 31,  4,  4);
     xlib::XSetForeground(display, gc, PANEL_DIM_TEXT);
-    xlib::XDrawString(display, buf, gc, px + 26, py + 36,
-                      c_line2.as_ptr(), line2.len() as i32);
+    xlib::XDrawString(display, buf, gc,
+        px + 26, py + 36, c_line2.as_ptr(), line2.len() as i32);
 }
 
-// ─── Help bar ────────────────────────────────────────────────────────────────
+// ─── Help bar (Fix #12: XTextWidth) ──────────────────────────────────────
 
 unsafe fn draw_help_bar(
-    display: *mut xlib::Display,
-    buf: xlib::Pixmap,
-    gc: xlib::GC,
-    sw: u32,
+    display:       *mut xlib::Display,
+    buf:           xlib::Pixmap,
+    gc:            xlib::GC,
+    font:          *mut xlib::XFontStruct,
+    sw:            u32,
     has_selection: bool,
 ) {
     let bar_h: u32 = 28;
@@ -865,66 +969,68 @@ unsafe fn draw_help_bar(
     xlib::XSetForeground(display, gc, 0x33_33_55);
     xlib::XDrawLine(display, buf, gc, 0, bar_h as i32, sw as i32, bar_h as i32);
 
+    // App name badge
     let app_name = "MintShot";
-    let c_app = std::ffi::CString::new(app_name).unwrap();
+    let c_app    = std::ffi::CString::new(app_name).unwrap();
     xlib::XSetForeground(display, gc, PANEL_ACCENT);
-    xlib::XDrawString(display, buf, gc, 12, 18,
-                      c_app.as_ptr(), app_name.len() as i32);
+    xlib::XDrawString(display, buf, gc,
+        12, 18, c_app.as_ptr(), app_name.len() as i32);
 
     xlib::XSetForeground(display, gc, 0x44_44_66);
     xlib::XDrawLine(display, buf, gc, 80, 5, 80, bar_h as i32 - 5);
 
-    // Updated shortcuts including ESC, Q, Enter
     let instructions: &[(&str, &str)] = if has_selection {
         &[
-            ("Release", "Capture"),
-            ("Enter", "Confirm"),
-            ("ESC", "Cancel"),
-            ("Q", "Cancel"),
+            ("Release",  "Capture"),
+            ("Enter",    "Confirm"),
+            ("ESC",      "Cancel"),
+            ("Q",        "Cancel"),
         ]
     } else {
         &[
-            ("Click+Drag", "Select area"),
-            ("ESC", "Cancel"),
-            ("Q", "Cancel"),
+            ("Click+Drag",  "Select area"),
+            ("ESC",         "Cancel"),
+            ("Q",           "Cancel"),
             ("Right Click", "Cancel"),
         ]
     };
 
     let mut offset_x: i32 = 92;
-
     for (key, desc) in instructions {
-        let key_w = (key.len() as i32) * 7 + 10;
+        // ✅ Fix #12: measure actual key width
+        let key_w = measure_text(font, key) + 10;
+
         xlib::XSetForeground(display, gc, HELP_KEY_BG);
         xlib::XFillRectangle(display, buf, gc,
             offset_x, 5, key_w as u32, 18);
 
         let c_key = std::ffi::CString::new(*key).unwrap();
         xlib::XSetForeground(display, gc, HELP_KEY_TEXT);
-        xlib::XDrawString(display, buf, gc, offset_x + 5, 18,
-                          c_key.as_ptr(), key.len() as i32);
+        xlib::XDrawString(display, buf, gc,
+            offset_x + 5, 18, c_key.as_ptr(), key.len() as i32);
 
         offset_x += key_w + 4;
 
+        let desc_w = measure_text(font, desc);
         let c_desc = std::ffi::CString::new(*desc).unwrap();
         xlib::XSetForeground(display, gc, HELP_TEXT);
-        xlib::XDrawString(display, buf, gc, offset_x, 18,
-                          c_desc.as_ptr(), desc.len() as i32);
+        xlib::XDrawString(display, buf, gc,
+            offset_x, 18, c_desc.as_ptr(), desc.len() as i32);
 
-        offset_x += (desc.len() as i32) * 7 + 16;
+        offset_x += desc_w + 16;
     }
 }
 
-// ─── Blit helper ──────────────────────────────────────────────────────────────
+// ─── Blit helper ──────────────────────────────────────────────────────────
 
 #[inline]
 unsafe fn blit(
     display: *mut xlib::Display,
-    src: xlib::Pixmap,
-    dst: xlib::Window,
-    gc: xlib::GC,
-    w: u32,
-    h: u32,
+    src:     xlib::Pixmap,
+    dst:     xlib::Window,
+    gc:      xlib::GC,
+    w:       u32,
+    h:       u32,
 ) {
     xlib::XCopyArea(display, src, dst, gc, 0, 0, w, h, 0, 0);
 }

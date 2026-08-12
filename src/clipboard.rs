@@ -1,126 +1,149 @@
 //! Clipboard module
 //!
-//! Copies screenshot image directly to system clipboard as PNG image data.
-//! Uses xclip (standard on Linux Mint) for reliable clipboard persistence —
-//! the image stays in clipboard even after MintShot exits.
+//! FIXES:
+//!   #4  — xsel removed (text-only, cannot carry image/png binary)
+//!   #10 — Accepts pre-encoded PNG bytes — no second encode pass
 //!
-//! Fallback chain:
-//!   1. xclip (preferred — handles image/png natively)
-//!   2. xsel  (fallback)
-//!   3. arboard (Rust-native, but clipboard clears on process exit)
+//! Fallback chain (all image-capable):
+//!   1. xclip  — image/png via stdin (best: persists after process exit)
+//!   2. arboard — Rust-native RGBA image (clears on exit without clip mgr)
+//!   3. xclip as filepath text — last resort, pastes file path not image
 
 use log::{info, warn};
+use std::borrow::Cow;
 use std::error::Error;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// Copy the screenshot PNG file to system clipboard as an image.
+// ─── Public API ───────────────────────────────────────────────────────────
+
+/// Copy screenshot to clipboard.
 ///
-/// After this call, the user can immediately Ctrl+V paste the screenshot
-/// into any application (Discord, Telegram, LibreOffice, GIMP, browser, etc.)
-pub fn copy_to_clipboard(filepath: &str) -> Result<(), Box<dyn Error>> {
-    // Try xclip first (most reliable on Linux Mint / Cinnamon)
-    if copy_with_xclip(filepath).is_ok() {
-        info!("Copied to clipboard via xclip (image/png)");
+/// `png_bytes` — pre-encoded PNG data from `save::save_png()`.
+///               Reusing saves a second encode pass (Fix #10).
+///
+/// `pixels`, `width`, `height` — raw RGBA; used only by arboard fallback.
+///
+/// `filepath` — used as last-resort text fallback.
+pub fn copy_to_clipboard(
+    png_bytes: &[u8],
+    pixels:    &[u8],
+    width:     u32,
+    height:    u32,
+    filepath:  &str,
+) -> Result<(), Box<dyn Error>> {
+
+    // 1. xclip image/png — persists after our process exits
+    if copy_with_xclip_image(png_bytes).is_ok() {
+        info!("Clipboard: xclip image/png ✓");
         return Ok(());
     }
 
-    // Try xsel as fallback
-    if copy_with_xsel(filepath).is_ok() {
-        info!("Copied to clipboard via xsel");
+    // 2. arboard — Rust-native, works without external tools
+    //    Clipboard clears on exit unless a clipboard manager is running,
+    //    but that's acceptable as a fallback.
+    if copy_with_arboard(pixels, width, height).is_ok() {
+        info!("Clipboard: arboard RGBA ✓ (may not persist without clipboard manager)");
         return Ok(());
     }
 
-    // If all external tools fail, try arboard (but warn it may not persist)
-    warn!("External clipboard tools not found, using arboard (may not persist)");
-    copy_with_arboard(filepath)
+    // 3. Last resort — filepath as text (user can open manually)
+    warn!("Image clipboard unavailable — copying filepath as text");
+    copy_filepath_as_text(filepath)?;
+    info!("Clipboard: filepath text ✓ ({})", filepath);
+    Ok(())
 }
 
-/// Copy using xclip — pipes raw PNG data as image/png MIME type
-///
-/// This is the gold standard for Linux clipboard image copying.
-/// The image persists in clipboard after our process exits because
-/// xclip runs as a background daemon holding the selection.
-fn copy_with_xclip(filepath: &str) -> Result<(), Box<dyn Error>> {
-    let png_data = std::fs::read(filepath)?;
+// ─── xclip image/png ──────────────────────────────────────────────────────
 
+/// Pipe raw PNG bytes into xclip as image/png.
+///
+/// xclip forks into the background and holds the selection, so the
+/// image survives after MintShot exits — this is the gold standard.
+fn copy_with_xclip_image(png_bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     let mut child = Command::new("xclip")
-        .args([
-            "-selection", "clipboard",
-            "-target", "image/png",
-            "-i",
-        ])
+        .args(["-selection", "clipboard", "-target", "image/png", "-i"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| {
-            info!("xclip not available: {}", e);
-            e
-        })?;
+        .map_err(|e| { info!("xclip not found: {}", e); e })?;
 
+    // Write PNG bytes then close stdin so xclip sees EOF
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&png_data)?;
+        stdin.write_all(png_bytes)?;
+        // stdin drop = EOF signal to xclip
     }
 
     let status = child.wait()?;
     if !status.success() {
-        return Err(format!("xclip exited with status: {}", status).into());
+        return Err(format!("xclip exited {}", status).into());
     }
-
     Ok(())
 }
 
-/// Copy using xsel (fallback — less common but available on some systems)
-fn copy_with_xsel(filepath: &str) -> Result<(), Box<dyn Error>> {
-    let png_data = std::fs::read(filepath)?;
+// ─── arboard (Fix #4: replaces xsel which is text-only) ──────────────────
 
-    let mut child = Command::new("xsel")
+/// Copy via arboard (Rust-native).
+///
+/// Arboard on X11 owns the selection only while the process lives.
+/// We sleep briefly so clipboard managers (Clipman, Parcellite, etc.)
+/// have time to intercept and persist the content.
+fn copy_with_arboard(
+    pixels: &[u8],
+    width:  u32,
+    height: u32,
+) -> Result<(), Box<dyn Error>> {
+    let mut cb = arboard::Clipboard::new()?;
+
+    cb.set_image(arboard::ImageData {
+        width:  width  as usize,
+        height: height as usize,
+        bytes:  Cow::Borrowed(pixels),
+    })?;
+
+    // Give clipboard manager ~600 ms to snapshot the content
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    Ok(())
+}
+
+// ─── Filepath text fallback ───────────────────────────────────────────────
+
+/// ✅ Fix #4: xsel IS suitable for plain text.
+/// Copy the saved filepath as text — last resort so the user knows
+/// where the file is even if image clipboard failed entirely.
+fn copy_filepath_as_text(filepath: &str) -> Result<(), Box<dyn Error>> {
+    // Try xclip text mode first
+    let mut child = Command::new("xclip")
+        .args(["-selection", "clipboard"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    if let Ok(mut c) = child {
+        if let Some(mut stdin) = c.stdin.take() {
+            let _ = stdin.write_all(filepath.as_bytes());
+        }
+        let _ = c.wait();
+        return Ok(());
+    }
+
+    // Try xsel for text (this IS valid — xsel handles text fine)
+    child = Command::new("xsel")
         .args(["--clipboard", "--input"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| {
-            info!("xsel not available: {}", e);
-            e
-        })?;
+        .spawn();
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&png_data)?;
+    if let Ok(mut c) = child {
+        if let Some(mut stdin) = c.stdin.take() {
+            let _ = stdin.write_all(filepath.as_bytes());
+        }
+        let _ = c.wait();
+        return Ok(());
     }
 
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("xsel exited with status: {}", status).into());
-    }
-
-    Ok(())
-}
-
-/// Rust-native clipboard via arboard (last resort)
-///
-/// WARNING: On X11, arboard clipboard content is lost when the process exits
-/// unless a clipboard manager is running. This is a known X11 limitation.
-fn copy_with_arboard(filepath: &str) -> Result<(), Box<dyn Error>> {
-    let img = image::open(filepath)?;
-    let rgba = img.to_rgba8();
-    let (width, height) = rgba.dimensions();
-    let pixels = rgba.into_raw();
-
-    let mut clipboard = arboard::Clipboard::new()?;
-
-    let img_data = arboard::ImageData {
-        width: width as usize,
-        height: height as usize,
-        bytes: std::borrow::Cow::Owned(pixels),
-    };
-
-    clipboard.set_image(img_data)?;
-
-    // Keep clipboard alive briefly so clipboard manager can grab it
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    info!("Copied via arboard (may not persist without clipboard manager)");
-    Ok(())
+    Err("No clipboard tool available for text fallback".into())
 }
