@@ -9,9 +9,11 @@
 
 use log::{info, warn};
 use std::fmt;
+use x11::xinerama;
 use x11::xlib;
 
 use crate::clipboard;
+use crate::selection::{bounding_box, DesktopGeometry};
 use crate::overlay;
 use crate::save;
 
@@ -99,16 +101,90 @@ impl XDisplay {
         self.0
     }
 
-    fn screen_info(&self) -> (u32, u32, xlib::Window) {
-        unsafe {
+    /// Bounding box of every active Xinerama screen (Fix #21).
+    ///
+    /// `XDisplayWidth`/`XDisplayHeight` describe the *default screen* only.
+    /// On a multi-monitor setup that meant the overlay covered a single
+    /// monitor, and monitors placed left of or above the primary one — whose
+    /// root coordinates are negative — were unreachable entirely.
+    ///
+    /// Falls back to the default screen when Xinerama is absent or inactive,
+    /// which keeps single-head systems behaving exactly as before.
+    fn desktop_geometry(&self) -> DesktopGeometry {
+        let (default_w, default_h, root) = unsafe {
             let screen = xlib::XDefaultScreen(self.0);
-            let width  = xlib::XDisplayWidth(self.0, screen)  as u32;
-            let height = xlib::XDisplayHeight(self.0, screen) as u32;
-            let root   = xlib::XRootWindow(self.0, screen);
-            (width, height, root)
+            (
+                xlib::XDisplayWidth(self.0, screen) as u32,
+                xlib::XDisplayHeight(self.0, screen) as u32,
+                xlib::XRootWindow(self.0, screen),
+            )
+        };
+
+        let fallback = DesktopGeometry {
+            x: 0,
+            y: 0,
+            width: default_w,
+            height: default_h,
+            root,
+        };
+
+        unsafe {
+            let mut event_base: std::os::raw::c_int = 0;
+            let mut error_base: std::os::raw::c_int = 0;
+            if xinerama::XineramaQueryExtension(
+                self.0,
+                &mut event_base,
+                &mut error_base,
+            ) == 0
+            {
+                info!("Xinerama extension not present — single-screen mode");
+                return fallback;
+            }
+            if xinerama::XineramaIsActive(self.0) == 0 {
+                info!("Xinerama not active — single-screen mode");
+                return fallback;
+            }
+
+            let mut count: std::os::raw::c_int = 0;
+            let infos = xinerama::XineramaQueryScreens(self.0, &mut count);
+            if infos.is_null() || count <= 0 {
+                warn!("XineramaQueryScreens returned nothing — single-screen mode");
+                return fallback;
+            }
+
+            let mut screens = Vec::with_capacity(count as usize);
+            for i in 0..count as isize {
+                let s = &*infos.offset(i);
+                let rect = (
+                    s.x_org as i32,
+                    s.y_org as i32,
+                    s.width.max(0) as u32,
+                    s.height.max(0) as u32,
+                );
+                info!(
+                    "  screen {}: {}x{} at ({}, {})",
+                    s.screen_number, rect.2, rect.3, rect.0, rect.1
+                );
+                screens.push(rect);
+            }
+            xlib::XFree(infos as *mut std::os::raw::c_void);
+
+            let (x, y, w, h) = match bounding_box(&screens) {
+                Some(b) => b,
+                None => return fallback,
+            };
+
+            // A degenerate box would produce a 0-area XGetImage.
+            if w == 0 || h == 0 {
+                warn!("Xinerama bounding box is empty — single-screen mode");
+                return fallback;
+            }
+
+            DesktopGeometry { x, y, width: w, height: h, root }
         }
     }
 }
+
 
 impl Drop for XDisplay {
     fn drop(&mut self) {
@@ -127,14 +203,15 @@ pub fn take_partial_screenshot() -> Result<String, CaptureError> {
 
     // Step 1: Open display (RAII — auto-closed at end of scope)
     let display = XDisplay::open()?;
-    let (screen_width, screen_height, root) = display.screen_info();
-    info!("Screen: {}x{}", screen_width, screen_height);
+    let geom = display.desktop_geometry();
+    info!(
+        "Desktop: {}x{} at ({}, {})",
+        geom.width, geom.height, geom.x, geom.y
+    );
 
     // Step 2: Show overlay — returns clean pixels + selection rect
-    let capture_result = overlay::show_selection_overlay(
-        display.as_ptr(), root, screen_width, screen_height,
-    )
-    .map_err(CaptureError::from)?;
+    let capture_result = overlay::show_selection_overlay(display.as_ptr(), &geom)
+        .map_err(CaptureError::from)?;
 
     let sel = &capture_result.selection;
     info!(
