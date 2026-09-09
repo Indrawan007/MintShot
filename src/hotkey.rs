@@ -41,10 +41,7 @@ static X_ERRORS: AtomicUsize = AtomicUsize::new(0);
 
 /// Count X errors instead of letting Xlib's default handler exit(1).
 /// This lets us detect BadAccess (hotkey conflict) gracefully.
-extern "C" fn count_x_error(
-    _display: *mut xlib::Display,
-    error: *mut xlib::XErrorEvent,
-) -> i32 {
+extern "C" fn count_x_error(_display: *mut xlib::Display, error: *mut xlib::XErrorEvent) -> i32 {
     unsafe {
         let code = (*error).error_code;
         if code == xlib::BadAccess {
@@ -156,14 +153,9 @@ fn resolve_capture_executable() -> Result<PathBuf, String> {
     }
 
     // 4. Last resort: search $PATH
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("mintshot")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("which").arg("mintshot").output() {
         if output.status.success() {
-            let path_str = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .to_string();
+            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path_str.is_empty() {
                 let p = PathBuf::from(&path_str);
                 if p.exists() {
@@ -210,9 +202,9 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
         // Grab with all modifier combinations (NumLock, CapsLock, both)
         let modifiers = [
             CTRL_SHIFT_MASK,
-            CTRL_SHIFT_MASK | xlib::Mod2Mask,                    // NumLock
-            CTRL_SHIFT_MASK | xlib::LockMask,                    // CapsLock
-            CTRL_SHIFT_MASK | xlib::Mod2Mask | xlib::LockMask,  // Both
+            CTRL_SHIFT_MASK | xlib::Mod2Mask, // NumLock
+            CTRL_SHIFT_MASK | xlib::LockMask, // CapsLock
+            CTRL_SHIFT_MASK | xlib::Mod2Mask | xlib::LockMask, // Both
         ];
 
         // Reset error counter, do all grabs, sync, then check for BadAccess.
@@ -265,6 +257,11 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
         let conn_fd = BorrowedFd::borrow_raw(xlib::XConnectionNumber(display));
         let mut event: xlib::XEvent = std::mem::zeroed();
 
+        // Single-flight guard: abaikan hotkey selama satu capture masih hidup.
+        // Menangkal X key auto-repeat (tahan tombol = N overlay bertumpuk)
+        // dan double-press yang cepat.
+        let capture_running = Arc::new(AtomicBool::new(false));
+
         'event_loop: while running.load(Ordering::Relaxed) {
             let mut pfd = PollFd::new(&conn_fd, PollFlags::POLLIN);
 
@@ -282,9 +279,9 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
 
                 Ok(_) => {
                     let revents = pfd.revents().unwrap_or(PollFlags::empty());
-                    if revents.intersects(
-                        PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL,
-                    ) {
+                    if revents
+                        .intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
+                    {
                         error!("X display connection lost — exiting");
                         break 'event_loop;
                     }
@@ -295,16 +292,16 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
 
                         if event.get_type() == xlib::KeyPress {
                             let key_event = event.key;
-                            let clean_state =
-                                key_event.state & !(xlib::Mod2Mask | xlib::LockMask);
+                            let clean_state = key_event.state & !(xlib::Mod2Mask | xlib::LockMask);
 
-                            if key_event.keycode == keycode as u32
-                                && clean_state == CTRL_SHIFT_MASK
+                            if key_event.keycode == keycode as u32 && clean_state == CTRL_SHIFT_MASK
                             {
-                                info!(
-                                    "🎯 Hotkey Ctrl+Shift+S detected — spawning capture..."
-                                );
-                                spawn_capture(&mut capture_exe);
+                                if capture_running.swap(true, Ordering::SeqCst) {
+                                    info!("Hotkey ignored — capture already in progress");
+                                } else {
+                                    info!("🎯 Hotkey Ctrl+Shift+S detected — spawning capture...");
+                                    spawn_capture(&mut capture_exe, Arc::clone(&capture_running));
+                                }
                             }
                         }
                     }
@@ -338,12 +335,15 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
 ///
 /// If the cached executable path fails (e.g. binary was replaced during
 /// upgrade), re-resolves the path and retries once.
-fn spawn_capture(cached_exe: &mut Option<PathBuf>) {
+///
+/// `capture_running` is cleared when the child exits (or immediately if
+/// spawn fails), so the next hotkey press is accepted again.
+fn spawn_capture(cached_exe: &mut Option<PathBuf>, capture_running: Arc<AtomicBool>) {
     // First attempt: use cached path
     if let Some(ref exe) = cached_exe {
-        match std::process::Command::new(exe).arg("--capture").spawn() {
-            Ok(child) => {
-                info!("Capture process spawned (pid {})", child.id());
+        match spawn_and_reap(exe, Arc::clone(&capture_running)) {
+            Ok(pid) => {
+                info!("Capture process spawned (pid {})", pid);
                 return;
             }
             Err(e) => {
@@ -360,22 +360,17 @@ fn spawn_capture(cached_exe: &mut Option<PathBuf>) {
     match resolve_capture_executable() {
         Ok(new_exe) => {
             info!("Re-resolved capture exe: {}", new_exe.display());
-            match std::process::Command::new(&new_exe)
-                .arg("--capture")
-                .spawn()
-            {
-                Ok(child) => {
-                    info!("Capture process spawned (pid {})", child.id());
+            match spawn_and_reap(&new_exe, Arc::clone(&capture_running)) {
+                Ok(pid) => {
+                    info!("Capture process spawned (pid {})", pid);
                     // Update cache for next time
                     *cached_exe = Some(new_exe);
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to spawn capture from {}: {}",
-                        new_exe.display(),
-                        e
-                    );
+                    error!("Failed to spawn capture from {}: {}", new_exe.display(), e);
                     *cached_exe = None;
+                    // Spawn gagal — izinkan hotkey berikutnya langsung retry.
+                    capture_running.store(false, Ordering::SeqCst);
                 }
             }
         }
@@ -383,8 +378,35 @@ fn spawn_capture(cached_exe: &mut Option<PathBuf>) {
             error!("Cannot find mintshot executable: {}", e);
             error!("Try reinstalling: bash install.sh");
             *cached_exe = None;
+            capture_running.store(false, Ordering::SeqCst);
         }
     }
+}
+
+/// Spawn satu capture child dan reap di detached thread.
+///
+/// Tanpa ini tiap capture meninggalkan zombie (daemon tidak pernah wait()).
+/// Thread memblokir di `wait()` sampai capture selesai (sukses/cancel/crash),
+/// lalu membuka kembali single-flight guard.
+fn spawn_and_reap(exe: &PathBuf, capture_running: Arc<AtomicBool>) -> std::io::Result<u32> {
+    let mut child = std::process::Command::new(exe).arg("--capture").spawn()?;
+    let pid = child.id();
+    thread::spawn(move || {
+        match child.wait() {
+            Ok(status) if status.success() => {
+                info!("Capture process {} finished", pid);
+            }
+            Ok(status) => {
+                // Cancel keluar 0 — non-zero berarti error betulan.
+                warn!("Capture process {} exited: {}", pid, status);
+            }
+            Err(e) => {
+                warn!("Failed to wait for capture process {}: {}", pid, e);
+            }
+        }
+        capture_running.store(false, Ordering::SeqCst);
+    });
+    Ok(pid)
 }
 
 // ─── Wait for X display ──────────────────────────────────────────────────────
@@ -395,9 +417,7 @@ fn spawn_capture(cached_exe: &mut Option<PathBuf>) {
 ///
 /// Critical for systemd user service or XDG autostart — the daemon may
 /// start before the X server is fully initialized.
-fn wait_for_display(
-    timeout_secs: u64,
-) -> Result<*mut xlib::Display, Box<dyn std::error::Error>> {
+fn wait_for_display(timeout_secs: u64) -> Result<*mut xlib::Display, Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
     let mut attempt = 0u32;
 
@@ -438,7 +458,7 @@ fn wait_for_display(
         if attempt == 1 {
             info!("Waiting for X display to become available...");
             info!("DISPLAY env: '{}'", display_env);
-        } else if attempt % 10 == 0 {
+        } else if attempt.is_multiple_of(10) {
             info!("Still waiting for X display... ({}s elapsed)", elapsed);
         }
 
