@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# MintShot Installation Script v1.2.0
+# MintShot Installation Script v1.2.1
 #
 # Per-user install: NO root, NO system directories, NO systemd, NO linger.
 # Everything lives under $HOME — fully reversible with uninstall.sh.
@@ -21,12 +21,18 @@ set -e
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 APP_NAME="mintshot"
-VERSION="1.2.0"
+VERSION="1.3.0"
 BIN_DIR="$HOME/.local/bin"
 APP_DIR="$HOME/.local/share/applications"
 AUTOSTART_DIR="$HOME/.config/autostart"
-PIDFILE="/tmp/${APP_NAME}-daemon.pid"
-DAEMON_LOG="/tmp/${APP_NAME}-daemon.log"
+# Runtime files go in the per-user runtime dir (mode 0700, cleared at logout)
+# rather than world-writable /tmp, where any local user could pre-create or
+# symlink the path. Falls back to /tmp when XDG_RUNTIME_DIR is unset.
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+PIDFILE="$RUNTIME_DIR/${APP_NAME}-daemon.pid"
+DAEMON_LOG="$RUNTIME_DIR/${APP_NAME}-daemon.log"
+# Pre-1.2.1 installs kept the pidfile in /tmp — still honoured when stopping.
+LEGACY_PIDFILE="/tmp/${APP_NAME}-daemon.pid"
 
 # ─── Colour helpers ───────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -45,11 +51,25 @@ info() { echo -e "  ${BLU}→${NC} $*"; }
 stop_existing_mintshot() {
     local stopped=false
 
-    # 1. PID file (most precise)
-    if [ -f "$PIDFILE" ]; then
+    # 1. PID files (most precise) — current location plus the legacy /tmp one
+    local pf
+    for pf in "$PIDFILE" "$LEGACY_PIDFILE"; do
+        [ -f "$pf" ] || continue
         local old_pid
-        old_pid=$(cat "$PIDFILE" 2>/dev/null || echo "")
+        old_pid=$(cat "$pf" 2>/dev/null || echo "")
         if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            # Guard against PID reuse after a reboot: only signal the process
+            # if its command line really is mintshot.
+            local is_ours=true
+            if [ -r "/proc/$old_pid/cmdline" ]; then
+                tr '\0' ' ' < "/proc/$old_pid/cmdline" 2>/dev/null \
+                    | grep -q "$APP_NAME" || is_ours=false
+            fi
+            if [ "$is_ours" = false ]; then
+                warn "Stale pidfile $pf (PID $old_pid is not mintshot)"
+                rm -f "$pf"
+                continue
+            fi
             kill "$old_pid" 2>/dev/null || true
             # Wait up to 3 seconds for graceful exit
             local waited=0
@@ -65,8 +85,8 @@ stop_existing_mintshot() {
             ok "Stopped previous daemon (PID: $old_pid)"
             stopped=true
         fi
-        rm -f "$PIDFILE"
-    fi
+        rm -f "$pf"
+    done
 
     # 2. Fallback: stop any mintshot processes from our install path
     if pgrep -u "$(id -u)" -f "$BIN_DIR/$APP_NAME" &>/dev/null; then
@@ -474,9 +494,9 @@ if [ "$VERIFY_OK" = true ]; then
     echo "║                                                      ║"
     echo "║  Screenshots:  ~/Pictures/MintShot/                  ║"
     echo "║  Clipboard:    Auto-copied (ready to Ctrl+V) ✓       ║"
-    echo "║  Daemon log:   /tmp/mintshot-daemon.log              ║"
     echo "║  Uninstall:    ./uninstall.sh                        ║"
     echo "╚══════════════════════════════════════════════════════╝"
+    info "Daemon log: $DAEMON_LOG"
 else
     echo "╔══════════════════════════════════════════════════════╗"
     echo "║    Installation completed with warnings ⚠            ║"

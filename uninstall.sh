@@ -1,5 +1,5 @@
 #!/bin/bash
-# MintShot Uninstaller v1.2.0
+# MintShot Uninstaller v1.3.0
 #
 # FIXES:
 #   #2  — PID-file based daemon stop (no wide pkill -f)
@@ -13,8 +13,13 @@ APP_NAME="mintshot"
 BIN_DIR="$HOME/.local/bin"
 APP_DIR="$HOME/.local/share/applications"
 AUTOSTART_DIR="$HOME/.config/autostart"
-PIDFILE="/tmp/${APP_NAME}-daemon.pid"
-DAEMON_LOG="/tmp/${APP_NAME}-daemon.log"
+# Must match install.sh. Pre-1.2.1 installs kept these in /tmp, so both
+# locations are checked.
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+PIDFILE="$RUNTIME_DIR/${APP_NAME}-daemon.pid"
+DAEMON_LOG="$RUNTIME_DIR/${APP_NAME}-daemon.log"
+LEGACY_PIDFILE="/tmp/${APP_NAME}-daemon.pid"
+LEGACY_DAEMON_LOG="/tmp/${APP_NAME}-daemon.log"
 
 # ─── Colour helpers ───────────────────────────────────────────────────────────
 GRN='\033[0;32m'; YLW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -25,7 +30,7 @@ err()  { echo -e "  ${RED}✗${NC} $*"; }
 # ─── Banner ───────────────────────────────────────────────────────────────────
 echo ""
 echo "╔══════════════════════════════════════╗"
-echo "║     MintShot Uninstaller v1.2.0      ║"
+echo "║     MintShot Uninstaller v1.3.0     ║"
 echo "╚══════════════════════════════════════╝"
 echo ""
 
@@ -59,7 +64,7 @@ fi
 
 echo "The following will be PRESERVED:"
 echo "  ~/Pictures/MintShot/   (your screenshots)"
-echo "  /tmp/${APP_NAME}-daemon.log   (daemon log, if any)"
+echo "  $DAEMON_LOG   (daemon log, if any)"
 echo ""
 
 read -r -p "Proceed with uninstall? [y/N] " confirm
@@ -78,10 +83,23 @@ echo "Stopping daemon..."
 
 DAEMON_STOPPED=false
 
-# Primary: use pidfile for precise targeting
-if [ -f "$PIDFILE" ]; then
-    STORED_PID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+# Primary: use pidfiles for precise targeting (current + legacy /tmp path)
+for pf in "$PIDFILE" "$LEGACY_PIDFILE"; do
+    [ -f "$pf" ] || continue
+    STORED_PID=$(cat "$pf" 2>/dev/null || echo "")
     if [ -n "$STORED_PID" ] && kill -0 "$STORED_PID" 2>/dev/null; then
+        # Guard against PID reuse after a reboot: only signal the process if
+        # its command line really is mintshot.
+        IS_OURS=true
+        if [ -r "/proc/$STORED_PID/cmdline" ]; then
+            tr '\0' ' ' < "/proc/$STORED_PID/cmdline" 2>/dev/null \
+                | grep -q "$APP_NAME" || IS_OURS=false
+        fi
+        if [ "$IS_OURS" = false ]; then
+            warn "Stale pidfile $pf (PID $STORED_PID is not mintshot)"
+            rm -f "$pf"
+            continue
+        fi
         kill "$STORED_PID" 2>/dev/null || true
         # Wait up to 2 seconds for graceful exit
         waited=0
@@ -98,8 +116,8 @@ if [ -f "$PIDFILE" ]; then
     else
         warn "PID $STORED_PID from pidfile is not running"
     fi
-    rm -f "$PIDFILE"
-fi
+    rm -f "$pf"
+done
 
 # Fallback: narrow pattern anchored to our specific binary path
 if [ "$DAEMON_STOPPED" = false ]; then
@@ -134,19 +152,20 @@ for f in "${USER_FILES[@]}"; do
     fi
 done
 
-# Remove daemon log (optional)
-if [ -f "$DAEMON_LOG" ]; then
-    read -r -p "  Remove daemon log ($DAEMON_LOG)? [y/N] " rm_log
+# Remove daemon logs (optional) — current location plus the legacy /tmp one
+for lf in "$DAEMON_LOG" "$LEGACY_DAEMON_LOG"; do
+    [ -f "$lf" ] || continue
+    read -r -p "  Remove daemon log ($lf)? [y/N] " rm_log
     case "$rm_log" in
         y|Y)
-            rm -f "$DAEMON_LOG"
-            ok "Removed: $DAEMON_LOG"
+            rm -f "$lf"
+            ok "Removed: $lf"
             ;;
         *)
-            warn "Log preserved: $DAEMON_LOG"
+            warn "Log preserved: $lf"
             ;;
     esac
-fi
+done
 
 # ─── Fix #12: Verify removal ──────────────────────────────────────────────────
 echo ""

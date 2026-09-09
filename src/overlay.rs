@@ -20,6 +20,10 @@
 //!   #6  — 8x8 stipple pattern for proper tiling
 //!   #9  — XSetErrorHandler restored after use
 //!   #12 — XTextWidth for accurate font measurement
+//!   #16 — Info panel is ASCII-only: the loaded font is ISO8859-1, so the
+//!         UTF-8 "×" reached the server as two latin-1 glyphs ("Ã—")
+//!   #17 — Unsupported XImage formats (PseudoColor, sub-byte depth) are
+//!         rejected with an error instead of silently yielding black pixels
 //!   — Crosshair via XFillRectangle (no wide-line rendering artifacts)
 //!   — Shadow + main line for high contrast on any background
 //!   — Motion dedup: skip redraw when cursor position unchanged
@@ -30,7 +34,7 @@ use std::ptr;
 use x11::keysym;
 use x11::xlib;
 
-use crate::selection::SelectionRect;
+use crate::selection::{DesktopGeometry, SelectionRect};
 
 // ─── Visual constants ──────────────────────────────────────────────────────
 
@@ -183,13 +187,13 @@ pub struct CaptureResult {
 
 // ─── Public entry point ────────────────────────────────────────────────────
 
+/// The overlay spans the whole virtual desktop described by `geom`, so a
+/// drag can start on one monitor and end on another.
 pub fn show_selection_overlay(
     display: *mut xlib::Display,
-    root: xlib::Window,
-    screen_width: u32,
-    screen_height: u32,
+    geom: &DesktopGeometry,
 ) -> Result<CaptureResult, Box<dyn Error>> {
-    unsafe { run_overlay(display, root, screen_width, screen_height) }
+    unsafe { run_overlay(display, geom) }
 }
 
 // ─── Rectangle-based line drawing helpers ──────────────────────────────────
@@ -257,10 +261,15 @@ unsafe fn measure_text(font: *mut xlib::XFontStruct, text: &str) -> i32 {
 
 unsafe fn run_overlay(
     display: *mut xlib::Display,
-    root: xlib::Window,
-    sw: u32,
-    sh: u32,
+    geom: &DesktopGeometry,
 ) -> Result<CaptureResult, Box<dyn Error>> {
+    let root = geom.root;
+    let sw = geom.width;
+    let sh = geom.height;
+    // Bounding-box origin in root coordinates. Negative when a monitor sits
+    // left of / above the primary one.
+    let ox = geom.x;
+    let oy = geom.y;
     let screen = xlib::XDefaultScreen(display);
     let visual = xlib::XDefaultVisual(display, screen);
     let depth = xlib::XDefaultDepth(display, screen);
@@ -277,11 +286,13 @@ unsafe fn run_overlay(
     );
 
     // ── Capture screen BEFORE overlay ─────────────────────────────────────
+    // Grab the whole virtual desktop, not just the default screen, so
+    // monitors at negative root coordinates are included (Fix #21).
     let bg = xlib::XGetImage(
         display,
         root,
-        0,
-        0,
+        ox,
+        oy,
         sw,
         sh,
         xlib::XAllPlanes(),
@@ -314,8 +325,8 @@ unsafe fn run_overlay(
     let win = xlib::XCreateWindow(
         display,
         root,
-        0,
-        0,
+        ox,
+        oy,
         sw,
         sh,
         0,
@@ -430,7 +441,19 @@ unsafe fn run_overlay(
     xlib::XSync(display, xlib::False);
 
     // Initial draw
-    full_redraw(display, buf, gc, bg_clean, bg_dim, sw, sh, font, None, None);
+    full_redraw(
+        display,
+        buf,
+        gc,
+        bg_clean,
+        bg_dim,
+        sw,
+        sh,
+        font,
+        None,
+        None,
+        (ox, oy),
+    );
     blit(display, buf, win, gc, sw, sh);
     xlib::XFlush(display);
 
@@ -516,6 +539,7 @@ unsafe fn run_overlay(
                     font,
                     sel.as_ref(),
                     cursor.as_ref(),
+                    (ox, oy),
                 );
                 blit(display, buf, win, gc, sw, sh);
                 xlib::XFlush(display);
@@ -547,6 +571,7 @@ unsafe fn run_overlay(
                             font,
                             None,
                             cursor.as_ref(),
+                            (ox, oy),
                         );
                         blit(display, buf, win, gc, sw, sh);
                         xlib::XFlush(display);
@@ -599,35 +624,54 @@ unsafe fn run_overlay(
     xlib::XSync(display, xlib::False);
 
     // ── Extract pixels BEFORE guard drops ──────────────────────────────────
-    let capture_result: Option<CaptureResult> = result_sel.and_then(|sel| {
-        let sel = sel.clamped_to(sw, sh);
-        if !sel.is_valid() {
-            return None;
+    // Ok(None)    → user cancelled / selection degenerate
+    // Ok(Some(_)) → pixels ready
+    // Err(_)      → real failure (unsupported pixel format) — must not be
+    //               reported as a cancellation, or exit code 0 hides it.
+    let extracted: Result<Option<CaptureResult>, String> = match result_sel {
+        None => Ok(None),
+        Some(sel) => {
+            let sel = sel.clamped_to(sw, sh);
+            if !sel.is_valid() {
+                Ok(None)
+            } else {
+                match extract_region_from_ximage(bg, &sel) {
+                    Ok(pixels) => {
+                        info!(
+                            "Extracted {} bytes for {}x{} region",
+                            pixels.len(),
+                            sel.width,
+                            sel.height
+                        );
+                        Ok(Some(CaptureResult {
+                            selection: sel,
+                            pixels,
+                        }))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
         }
-        let pixels = extract_region_from_ximage(bg, &sel);
-        info!(
-            "Extracted {} bytes for {}x{} region",
-            pixels.len(),
-            sel.width,
-            sel.height
-        );
-        Some(CaptureResult {
-            selection: sel,
-            pixels,
-        })
-    });
+    };
 
     // ── Restore previous X error handler ───────────────────────────────────
     xlib::XSetErrorHandler(prev_handler);
 
     // guard drops here → all X11 resources freed in correct order
 
-    capture_result.ok_or_else(|| "Selection cancelled".into())
+    match extracted {
+        Ok(Some(res)) => Ok(res),
+        Ok(None) => Err("Selection cancelled".into()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ─── Extract pixels from XImage ───────────────────────────────────────────
 
-unsafe fn extract_region_from_ximage(image: *mut xlib::XImage, sel: &SelectionRect) -> Vec<u8> {
+unsafe fn extract_region_from_ximage(
+    image: *mut xlib::XImage,
+    sel: &SelectionRect,
+) -> Result<Vec<u8>, String> {
     let img = &*image;
     let data = img.data as *const u8;
 
@@ -643,7 +687,7 @@ unsafe fn extract_region_from_ximage(image: *mut xlib::XImage, sel: &SelectionRe
     let blue_shift = mask_shift(blue_mask);
 
     log::info!(
-        "XImage — bpp={}, R=0x{:06X}(>>{}), G=0x{:06X}(>>{}), B=0x{:06X}(>>{})",
+        "XImage — bits_per_pixel={}, R=0x{:06X}(>>{}), G=0x{:06X}(>>{}), B=0x{:06X}(>>{})",
         img.bits_per_pixel,
         red_mask,
         red_shift,
@@ -652,6 +696,20 @@ unsafe fn extract_region_from_ximage(image: *mut xlib::XImage, sel: &SelectionRe
         blue_mask,
         blue_shift,
     );
+
+    // ── Reject formats the mask math below cannot decode (Fix #17) ────────
+    // PseudoColor/StaticGray visuals report all-zero RGB masks, and a
+    // sub-byte depth makes `bpp` zero. Both used to fall through to the
+    // generic path and silently emit solid black pixels — the user got a
+    // valid-looking PNG of nothing. Fail loudly instead.
+    if bpp == 0 || red_mask == 0 || green_mask == 0 || blue_mask == 0 {
+        return Err(format!(
+            "XGetImage returned an unsupported pixel format — \
+             bits_per_pixel={}, R=0x{:06X} G=0x{:06X} B=0x{:06X}. \
+             A TrueColor/DirectColor visual is required.",
+            img.bits_per_pixel, red_mask, green_mask, blue_mask
+        ));
+    }
 
     let img_w = img.width as u32;
     let img_h = img.height as u32;
@@ -679,7 +737,7 @@ unsafe fn extract_region_from_ximage(image: *mut xlib::XImage, sel: &SelectionRe
                 pixels.push(255); // A
             }
         }
-        return pixels;
+        return Ok(pixels);
     }
 
     // ── Fast path: 24-bit BGR ──────────────────────────────────────────
@@ -699,7 +757,7 @@ unsafe fn extract_region_from_ximage(image: *mut xlib::XImage, sel: &SelectionRe
                 pixels.push(255);
             }
         }
-        return pixels;
+        return Ok(pixels);
     }
 
     // ── Generic path: mask-based extraction ────────────────────────────
@@ -732,7 +790,7 @@ unsafe fn extract_region_from_ximage(image: *mut xlib::XImage, sel: &SelectionRe
         }
     }
 
-    pixels
+    Ok(pixels);
 }
 
 fn mask_shift(mask: u32) -> u32 {
@@ -762,12 +820,15 @@ unsafe fn full_redraw(
     font: *mut xlib::XFontStruct,
     selection: Option<&SelectionRect>,
     cursor: Option<&CursorPos>,
+    origin: (i32, i32),
 ) {
     xlib::XCopyArea(display, bg_dim, buf, gc, 0, 0, sw, sh, 0, 0);
 
     match selection {
         Some(sel) if sel.is_valid() => {
-            draw_selection(display, buf, gc, bg_clean, sw, sh, font, sel, cursor);
+            draw_selection(
+                display, buf, gc, bg_clean, sw, sh, font, sel, cursor, origin,
+            );
         }
         _ => {
             if let Some(c) = cursor {
@@ -845,6 +906,7 @@ unsafe fn draw_selection(
     font: *mut xlib::XFontStruct,
     sel: &SelectionRect,
     cursor: Option<&CursorPos>,
+    origin: (i32, i32),
 ) {
     let sx = sel.x as i32;
     let sy = sel.y as i32;
@@ -938,7 +1000,7 @@ unsafe fn draw_selection(
     }
 
     // ── Info panel ────────────────────────────────────────────────────────
-    draw_info_panel(display, buf, gc, font, sel, sw, sh);
+    draw_info_panel(display, buf, gc, font, sel, sw, sh, origin);
 }
 
 // ─── Corner handles ───────────────────────────────────────────────────────
@@ -1051,9 +1113,18 @@ unsafe fn draw_info_panel(
     sel: &SelectionRect,
     sw: u32,
     sh: u32,
+    origin: (i32, i32),
 ) {
-    let line1 = format!(" {}  ×  {} px", sel.width, sel.height);
-    let line2 = format!(" Position: ({}, {})", sel.x, sel.y);
+    // ASCII only (Fix #16): the loaded font is ISO8859-1, so any multi-byte
+    // UTF-8 character reaches the server as separate latin-1 glyphs.
+    let line1 = format!(" {}  x  {} px", sel.width, sel.height);
+    // Report root coordinates, not overlay-relative ones, so the numbers
+    // match xrandr on a multi-monitor desktop (Fix #21).
+    let line2 = format!(
+        " Position: ({}, {})",
+        sel.x as i32 + origin.0,
+        sel.y as i32 + origin.1
+    );
 
     let content_w = measure_text(font, &line1).max(measure_text(font, &line2));
     let panel_w = (content_w + 50).max(240) as u32;
@@ -1208,4 +1279,34 @@ unsafe fn blit(
     h: u32,
 ) {
     xlib::XCopyArea(display, src, dst, gc, 0, 0, w, h, 0, 0);
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────
+// `mask_shift` is pure integer math — no X connection required.
+
+#[cfg(test)]
+mod tests {
+    use super::mask_shift;
+
+    #[test]
+    fn mask_shift_returns_offset_of_lowest_set_bit() {
+        assert_eq!(mask_shift(0x00_FF_00_00), 16); // R in a 32-bit BGRX layout
+        assert_eq!(mask_shift(0x00_00_FF_00), 8); // G
+        assert_eq!(mask_shift(0x00_00_00_FF), 0); // B
+    }
+
+    #[test]
+    fn mask_shift_handles_rgb565() {
+        assert_eq!(mask_shift(0xF800), 11);
+        assert_eq!(mask_shift(0x07E0), 5);
+        assert_eq!(mask_shift(0x001F), 0);
+    }
+
+    #[test]
+    fn mask_shift_of_zero_mask_terminates() {
+        // PseudoColor visuals report all-zero masks. The extraction path
+        // rejects those before shifting, but the helper itself must not
+        // spin forever on the degenerate input.
+        assert_eq!(mask_shift(0), 0);
+    }
 }

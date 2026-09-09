@@ -13,7 +13,7 @@ set -e
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 APP_NAME="mintshot"
-VERSION="1.2.0"
+VERSION="1.3.0"
 ARCH=$(dpkg --print-architecture)
 MAINTAINER="MintShot Team <mintshot@localhost>"
 DESCRIPTION="Lightweight partial screenshot tool for Linux Mint"
@@ -44,7 +44,33 @@ if [ ! -f "Cargo.toml" ]; then
     exit 1
 fi
 
-# Fix #8: Safe Cargo.toml version update via awk (context-aware)
+# ─── Cargo.toml version sync with rollback (Fix #19) ─────────────────────────
+#
+# Rewriting a tracked file in place is only safe if an interruption cannot
+# leave it corrupt. Two changes from the previous version:
+#   • the backup lives in $TMPDIR, never as Cargo.toml.bak in the tree
+#     (a stray *.bak is exactly how src/capture.rs.bak got committed)
+#   • an EXIT/INT/TERM trap restores the file if we die mid-rewrite
+#
+# CARGO_TOML_SAFE flips to true once Cargo.toml is known-good again, so a
+# *successful* sync is kept (that is the point of this step) and only an
+# interrupted one is rolled back.
+CARGO_TOML_BACKUP=""
+CARGO_TOML_SAFE=false
+
+restore_cargo_toml() {
+    [ -n "$CARGO_TOML_BACKUP" ] || return 0
+    if [ "$CARGO_TOML_SAFE" = false ]; then
+        warn "Interrupted version update — restoring original Cargo.toml"
+        cp "$CARGO_TOML_BACKUP" "Cargo.toml" 2>/dev/null || true
+    fi
+    rm -f "$CARGO_TOML_BACKUP"
+    CARGO_TOML_BACKUP=""
+}
+trap restore_cargo_toml EXIT
+trap 'restore_cargo_toml; exit 130' INT
+trap 'restore_cargo_toml; exit 143' TERM
+
 update_cargo_version() {
     local target="$1"
     local cargo_file="Cargo.toml"
@@ -61,11 +87,13 @@ update_cargo_version() {
 
     if [ "$current" = "$target" ]; then
         ok "Cargo.toml already at v${target}"
+        CARGO_TOML_SAFE=true
         return
     fi
 
-    # Backup before modifying
-    cp "$cargo_file" "$cargo_file.bak"
+    # Backup OUTSIDE the repo before modifying
+    CARGO_TOML_BACKUP=$(mktemp "${TMPDIR:-/tmp}/mintshot-cargo-toml.XXXXXX")
+    cp "$cargo_file" "$CARGO_TOML_BACKUP"
 
     # awk: only replace version inside [package] section
     awk '
@@ -76,7 +104,7 @@ update_cargo_version() {
             next
         }
         { print }
-    ' "$cargo_file.bak" > "$cargo_file"
+    ' "$CARGO_TOML_BACKUP" > "$cargo_file"
 
     # Verify result
     local new_ver
@@ -85,12 +113,11 @@ update_cargo_version() {
 
     if [ "$new_ver" != "$target" ]; then
         err "Version update failed — restoring backup"
-        cp "$cargo_file.bak" "$cargo_file"
-        rm -f "$cargo_file.bak"
+        restore_cargo_toml
         exit 1
     fi
 
-    rm -f "$cargo_file.bak"
+    CARGO_TOML_SAFE=true
     ok "Cargo.toml updated: v${current} → v${target}"
 }
 
@@ -334,9 +361,7 @@ Priority: optional
 Architecture: ${ARCH}
 Installed-Size: ${INSTALLED_SIZE}
 Depends: libx11-6 (>= 2:1.6),
-         libxfixes3,
-         libxrender1,
-         libxcursor1,
+         libxinerama1,
          xclip | xdotool,
          libnotify-bin | libnotify4
 Recommends: xclip

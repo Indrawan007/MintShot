@@ -7,6 +7,8 @@
 //!   #1  — Signal handler sets running=false (not true)
 //!   #7  — attempt % 10 instead of is_multiple_of (stable Rust)
 //!   #9  — XSetErrorHandler restored after use
+//!   #18 — Ignorable state bits (NumLock/CapsLock/Mod5/held mouse buttons)
+//!         no longer make a delivered KeyPress fail the modifier comparison
 //!   — resolve_capture_executable() fallback chain instead of current_exe() only
 //!   — Handles binary replacement during upgrade (no "file not found" after install)
 
@@ -25,6 +27,58 @@ use x11::xlib;
 // ─── Hotkey configuration ─────────────────────────────────────────────────────
 
 const CTRL_SHIFT_MASK: u32 = xlib::ControlMask | xlib::ShiftMask;
+
+/// State bits that must NOT invalidate a hotkey press (Fix #18).
+///
+/// The X server matches a passive key grab on *keyboard* modifiers only, so
+/// the KeyPress is delivered even when one of these bits is set — but
+/// `XKeyEvent.state` still carries them, and a strict
+/// `state == CTRL_SHIFT_MASK` comparison would silently swallow the press.
+///
+///   Mod2Mask (0x10) — NumLock       LockMask (0x02) — CapsLock
+///   Mod5Mask (0x80) — ISO Level3 / AltGr on some layouts
+///   Button1Mask..Button5Mask (0x1F00) — a mouse button held down while
+///                     the hotkey is pressed
+///
+/// Values verified against x11 crate v2.21.0 (the version pinned in
+/// Cargo.lock): all are `c_uint`.
+///
+/// Mod1/Mod3/Mod4 (Alt, Mod3, Super) stay significant — Super+Ctrl+Shift+S
+/// is a genuinely different combination.
+const IGNORABLE_STATE_MASK: u32 = xlib::Mod2Mask
+    | xlib::LockMask
+    | xlib::Mod5Mask
+    | xlib::Button1Mask
+    | xlib::Button2Mask
+    | xlib::Button3Mask
+    | xlib::Button4Mask
+    | xlib::Button5Mask;
+
+/// State bits that must NOT invalidate a hotkey press (Fix #18).
+///
+/// The X server matches a passive key grab on *keyboard* modifiers only, so
+/// the KeyPress is delivered even when one of these bits is set — but
+/// `XKeyEvent.state` still carries them, and a strict
+/// `state == CTRL_SHIFT_MASK` comparison would silently swallow the press.
+///
+///   Mod2Mask (0x10) — NumLock       LockMask (0x02) — CapsLock
+///   Mod5Mask (0x80) — ISO Level3 / AltGr on some layouts
+///   Button1Mask..Button5Mask (0x1F00) — a mouse button held down while
+///                     the hotkey is pressed
+///
+/// Values verified against x11 crate v2.21.0 (the version pinned in
+/// Cargo.lock): all are `c_uint`.
+///
+/// Mod1/Mod3/Mod4 (Alt, Mod3, Super) stay significant — Super+Ctrl+Shift+S
+/// is a genuinely different combination.
+const IGNORABLE_STATE_MASK: u32 = xlib::Mod2Mask
+    | xlib::LockMask
+    | xlib::Mod5Mask
+    | xlib::Button1Mask
+    | xlib::Button2Mask
+    | xlib::Button3Mask
+    | xlib::Button4Mask
+    | xlib::Button5Mask;
 
 /// Maximum time to wait for X display to become available (60 seconds).
 /// Handles daemon started before X server is ready (e.g. early boot via
@@ -292,7 +346,7 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
 
                         if event.get_type() == xlib::KeyPress {
                             let key_event = event.key;
-                            let clean_state = key_event.state & !(xlib::Mod2Mask | xlib::LockMask);
+                            let clean_state = key_event.state & !IGNORABLE_STATE_MASK;
 
                             if key_event.keycode == keycode as u32 && clean_state == CTRL_SHIFT_MASK
                             {
@@ -454,11 +508,13 @@ fn wait_for_display(timeout_secs: u64) -> Result<*mut xlib::Display, Box<dyn std
             .into());
         }
 
-        // Log periodically (Fix #7: stable Rust — no is_multiple_of)
+        // Log periodically (Fix #7: plain modulo, not `is_multiple_of` —
+        // that method only exists on recent stable, and the comment above
+        // already claimed we avoid it).
         if attempt == 1 {
             info!("Waiting for X display to become available...");
             info!("DISPLAY env: '{}'", display_env);
-        } else if attempt.is_multiple_of(10) {
+        } else if attempt % 10 == 0 {
             info!("Still waiting for X display... ({}s elapsed)", elapsed);
         }
 
