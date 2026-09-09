@@ -5,7 +5,8 @@
 //!
 //! FIXES APPLIED:
 //!   #1  — Signal handler sets running=false (not true)
-//!   #7  — attempt % 10 instead of is_multiple_of (stable Rust)
+//!   #7  — attempt.is_multiple_of(10); stable since Rust 1.87, which is now
+//!         declared as rust-version in Cargo.toml
 //!   #9  — XSetErrorHandler restored after use
 //!   #18 — Ignorable state bits (NumLock/CapsLock/Mod5/held mouse buttons)
 //!         no longer make a delivered KeyPress fail the modifier comparison
@@ -552,13 +553,12 @@ fn wait_for_display(timeout_secs: u64) -> Result<*mut xlib::Display, Box<dyn std
             .into());
         }
 
-        // Log periodically (Fix #7: plain modulo, not `is_multiple_of` —
-        // that method only exists on recent stable, and the comment above
-        // already claimed we avoid it).
+        // Log on the first attempt, then every tenth. `is_multiple_of` is
+        // stable since Rust 1.87 — see rust-version in Cargo.toml.
         if attempt == 1 {
             info!("Waiting for X display to become available...");
             info!("DISPLAY env: '{}'", display_env);
-        } else if attempt % 10 == 0 {
+        } else if attempt.is_multiple_of(10) {
             info!("Still waiting for X display... ({}s elapsed)", elapsed);
         }
 

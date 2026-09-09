@@ -13,7 +13,7 @@ set -e
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 APP_NAME="mintshot"
-VERSION="1.3.0"
+VERSION="1.3.1"
 ARCH=$(dpkg --print-architecture)
 MAINTAINER="MintShot Team <mintshot@localhost>"
 DESCRIPTION="Lightweight partial screenshot tool for Linux Mint"

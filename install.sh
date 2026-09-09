@@ -21,7 +21,7 @@ set -e
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 APP_NAME="mintshot"
-VERSION="1.3.0"
+VERSION="1.3.1"
 BIN_DIR="$HOME/.local/bin"
 APP_DIR="$HOME/.local/share/applications"
 AUTOSTART_DIR="$HOME/.config/autostart"

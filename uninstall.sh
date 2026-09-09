@@ -1,5 +1,5 @@
 #!/bin/bash
-# MintShot Uninstaller v1.3.0
+# MintShot Uninstaller v1.3.1
 #
 # FIXES:
 #   #2  — PID-file based daemon stop (no wide pkill -f)
@@ -30,7 +30,7 @@ err()  { echo -e "  ${RED}✗${NC} $*"; }
 # ─── Banner ───────────────────────────────────────────────────────────────────
 echo ""
 echo "╔══════════════════════════════════════╗"
-echo "║     MintShot Uninstaller v1.3.0     ║"
+echo "║     MintShot Uninstaller v1.3.1     ║"
 echo "╚══════════════════════════════════════╝"
 echo ""
 
