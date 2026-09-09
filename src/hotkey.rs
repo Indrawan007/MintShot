@@ -5,10 +5,13 @@
 //!
 //! FIXES APPLIED:
 //!   #1  — Signal handler sets running=false (not true)
-//!   #7  — attempt % 10 instead of is_multiple_of (stable Rust)
+//!   #7  — attempt.is_multiple_of(10); stable since Rust 1.87, which is now
+//!         declared as rust-version in Cargo.toml
 //!   #9  — XSetErrorHandler restored after use
 //!   #18 — Ignorable state bits (NumLock/CapsLock/Mod5/held mouse buttons)
 //!         no longer make a delivered KeyPress fail the modifier comparison
+//!   #20 — X connection loss triggers reconnect with backoff instead of
+//!         ending the daemon for the rest of the session
 //!   — resolve_capture_executable() fallback chain instead of current_exe() only
 //!   — Handles binary replacement during upgrade (no "file not found" after install)
 
@@ -27,32 +30,6 @@ use x11::xlib;
 // ─── Hotkey configuration ─────────────────────────────────────────────────────
 
 const CTRL_SHIFT_MASK: u32 = xlib::ControlMask | xlib::ShiftMask;
-
-/// State bits that must NOT invalidate a hotkey press (Fix #18).
-///
-/// The X server matches a passive key grab on *keyboard* modifiers only, so
-/// the KeyPress is delivered even when one of these bits is set — but
-/// `XKeyEvent.state` still carries them, and a strict
-/// `state == CTRL_SHIFT_MASK` comparison would silently swallow the press.
-///
-///   Mod2Mask (0x10) — NumLock       LockMask (0x02) — CapsLock
-///   Mod5Mask (0x80) — ISO Level3 / AltGr on some layouts
-///   Button1Mask..Button5Mask (0x1F00) — a mouse button held down while
-///                     the hotkey is pressed
-///
-/// Values verified against x11 crate v2.21.0 (the version pinned in
-/// Cargo.lock): all are `c_uint`.
-///
-/// Mod1/Mod3/Mod4 (Alt, Mod3, Super) stay significant — Super+Ctrl+Shift+S
-/// is a genuinely different combination.
-const IGNORABLE_STATE_MASK: u32 = xlib::Mod2Mask
-    | xlib::LockMask
-    | xlib::Mod5Mask
-    | xlib::Button1Mask
-    | xlib::Button2Mask
-    | xlib::Button3Mask
-    | xlib::Button4Mask
-    | xlib::Button5Mask;
 
 /// State bits that must NOT invalidate a hotkey press (Fix #18).
 ///
@@ -228,11 +205,73 @@ fn resolve_capture_executable() -> Result<PathBuf, String> {
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
+/// Why one listener session ended.
+enum ListenerOutcome {
+    /// `running` was cleared — a clean, requested shutdown.
+    Stopped,
+    /// The X connection died (server restart, logout). Worth reconnecting.
+    ConnectionLost,
+}
+
 /// Listen for the Ctrl+Shift+S global hotkey.
 ///
-/// Blocks until `running` is set to false (via signal handler) or the
-/// X display connection is lost.
+/// Blocks until `running` is cleared by a signal handler.
+///
+/// An X connection loss is no longer fatal (Fix #20): the session is torn
+/// down and re-established with exponential backoff capped at 30s, so an X
+/// server restart no longer silently kills the daemon for the rest of the
+/// session. A hotkey *conflict* is still returned immediately — retrying it
+/// would just spin.
 pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
+    let mut backoff = Duration::from_secs(1);
+    let mut ever_connected = false;
+
+    loop {
+        match run_listener(Arc::clone(&running)) {
+            Ok(ListenerOutcome::Stopped) => return Ok(()),
+            Ok(ListenerOutcome::ConnectionLost) => ever_connected = true,
+            // Another app owns Ctrl+Shift+S — retrying cannot help.
+            Err(e @ HotkeyError::Conflict) => return Err(e),
+            Err(e) => {
+                // The display never came up. Fatal on a cold start (the old
+                // behaviour); retryable once we have connected before, since
+                // that means the session went away, not that we are
+                // misconfigured.
+                if !ever_connected {
+                    return Err(e);
+                }
+                error!("Listener session failed: {}", e);
+            }
+        }
+
+        if !running.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        warn!(
+            "Reconnecting in {}s — send SIGINT/SIGTERM to stop",
+            backoff.as_secs()
+        );
+        interruptible_sleep(backoff, &running);
+        if !running.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+/// Sleep in short slices so a signal is noticed within ~100 ms.
+fn interruptible_sleep(total: Duration, running: &AtomicBool) {
+    let slice = Duration::from_millis(100);
+    let mut remaining = total;
+    while remaining > Duration::ZERO && running.load(Ordering::Relaxed) {
+        let step = remaining.min(slice);
+        thread::sleep(step);
+        remaining -= step;
+    }
+}
+
+/// One X-connection session: open the display, grab the hotkey, pump events.
+fn run_listener(running: Arc<AtomicBool>) -> Result<ListenerOutcome, HotkeyError> {
     // ─── Wait for X display to be available ───────────────────────────────
     let display = wait_for_display(DISPLAY_WAIT_TIMEOUT_SECS)
         .map_err(|e| HotkeyError::Other(e.to_string()))?;
@@ -336,7 +375,7 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
                     if revents
                         .intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
                     {
-                        error!("X display connection lost — exiting");
+                        error!("X display connection lost");
                         break 'event_loop;
                     }
 
@@ -365,7 +404,7 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
                 Err(Errno::EINTR) => continue,
 
                 Err(e) => {
-                    error!("poll() error: {} — exiting", e);
+                    error!("poll() error: {}", e);
                     break 'event_loop;
                 }
             }
@@ -380,7 +419,13 @@ pub fn listen_hotkey(running: Arc<AtomicBool>) -> Result<(), HotkeyError> {
         xlib::XCloseDisplay(display);
     }
 
-    Ok(())
+    // The event loop exits either because `running` was cleared (clean
+    // shutdown) or because it broke out early on a dead connection.
+    Ok(if running.load(Ordering::Relaxed) {
+        ListenerOutcome::ConnectionLost
+    } else {
+        ListenerOutcome::Stopped
+    })
 }
 
 // ─── Spawn capture subprocess ────────────────────────────────────────────────
@@ -508,17 +553,16 @@ fn wait_for_display(timeout_secs: u64) -> Result<*mut xlib::Display, Box<dyn std
             .into());
         }
 
-        // Log periodically (Fix #7: plain modulo, not `is_multiple_of` —
-        // that method only exists on recent stable, and the comment above
-        // already claimed we avoid it).
+        // Log on the first attempt, then every tenth. `is_multiple_of` is
+        // stable since Rust 1.87 — see rust-version in Cargo.toml.
         if attempt == 1 {
             info!("Waiting for X display to become available...");
             info!("DISPLAY env: '{}'", display_env);
-        } else if attempt % 10 == 0 {
+        } else if attempt.is_multiple_of(10) {
             info!("Still waiting for X display... ({}s elapsed)", elapsed);
         }
 
-        // Exponential backoff: 100ms → 200ms → 400ms → … → max 2s
+        // Exponenattempt.is_multiple_of(10)ms → 200ms → 400ms → … → max 2s
         let wait_ms = (100u64 * (1u64 << attempt.min(4))).min(2000);
         thread::sleep(Duration::from_millis(wait_ms));
     }

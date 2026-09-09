@@ -47,88 +47,6 @@ impl SelectionRect {
     }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
-// Pure geometry, no X11 needed — these run under a plain `cargo test`.
-
-#[cfg(test)]
-mod tests {
-    use super::SelectionRect;
-
-    fn rect(x: u32, y: u32, w: u32, h: u32) -> SelectionRect {
-        SelectionRect {
-            x,
-            y,
-            width: w,
-            height: h,
-        }
-    }
-
-    #[test]
-    fn from_points_handles_left_to_right_drag() {
-        let r = SelectionRect::from_points(10, 20, 110, 220);
-        assert_eq!((r.x, r.y, r.width, r.height), (10, 20, 100, 200));
-    }
-
-    #[test]
-    fn from_points_handles_right_to_left_drag() {
-        // Same rectangle as above, dragged the other way.
-        let r = SelectionRect::from_points(110, 220, 10, 20);
-        assert_eq!((r.x, r.y, r.width, r.height), (10, 20, 100, 200));
-    }
-
-    #[test]
-    fn from_points_clamps_negative_origin_to_zero() {
-        // Drag starting off the top-left edge: origin floors at 0, but the
-        // size is still measured between the two real points.
-        let r = SelectionRect::from_points(-50, -60, 50, 60);
-        assert_eq!((r.x, r.y, r.width, r.height), (0, 0, 100, 120));
-    }
-
-    #[test]
-    fn from_points_of_single_click_has_no_area() {
-        let r = SelectionRect::from_points(100, 100, 100, 100);
-        assert_eq!((r.width, r.height), (0, 0));
-        assert!(!r.is_valid());
-    }
-
-    #[test]
-    fn is_valid_requires_two_pixels_per_axis() {
-        assert!(!rect(0, 0, 1, 100).is_valid());
-        assert!(!rect(0, 0, 100, 1).is_valid());
-        assert!(rect(0, 0, 2, 2).is_valid());
-    }
-
-    #[test]
-    fn clamped_to_truncates_selection_running_off_screen() {
-        let r = rect(100, 100, 500, 500).clamped_to(300, 300);
-        assert_eq!((r.x, r.y, r.width, r.height), (100, 100, 200, 200));
-    }
-
-    #[test]
-    fn clamped_to_never_extends_past_the_last_pixel() {
-        let r = rect(1000, 1000, 50, 50).clamped_to(300, 300);
-        // Origin pins to the last pixel, leaving a 1x1 (invalid) remainder.
-        assert_eq!((r.x, r.y, r.width, r.height), (299, 299, 1, 1));
-        assert!(!r.is_valid());
-    }
-
-    #[test]
-    fn clamped_to_leaves_full_screen_selection_intact() {
-        let r = rect(0, 0, 1920, 1080).clamped_to(1920, 1080);
-        assert_eq!((r.x, r.y, r.width, r.height), (0, 0, 1920, 1080));
-    }
-
-    #[test]
-    fn clamped_to_is_idempotent() {
-        let once = rect(250, 250, 400, 400).clamped_to(300, 300);
-        let twice = once.clamped_to(300, 300);
-        assert_eq!(
-            (once.x, once.y, once.width, once.height),
-            (twice.x, twice.y, twice.width, twice.height)
-        );
-    }
-}
-
 /// Full virtual-desktop geometry across all monitors (Fix #21).
 ///
 /// `x`/`y` are the bounding-box origin in root coordinates and may be
@@ -167,7 +85,7 @@ pub fn bounding_box(screens: &[(i32, i32, u32, u32)]) -> Option<(i32, i32, u32, 
 
 #[cfg(test)]
 mod tests {
-    use super::SelectionRect;
+    use super::{bounding_box, SelectionRect};
 
     fn rect(x: u32, y: u32, w: u32, h: u32) -> SelectionRect {
         SelectionRect {

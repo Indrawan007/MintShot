@@ -790,7 +790,7 @@ unsafe fn extract_region_from_ximage(
         }
     }
 
-    Ok(pixels);
+    Ok(pixels)
 }
 
 fn mask_shift(mask: u32) -> u32 {
@@ -1105,6 +1105,9 @@ unsafe fn draw_coord_tooltip(
 
 // ─── Info panel ───────────────────────────────────────────────────────────
 
+// 8 arguments since Fix #21 added `origin`; kept flat to match full_redraw
+// and draw_selection rather than threading a context struct through all three.
+#[allow(clippy::too_many_arguments)]
 unsafe fn draw_info_panel(
     display: *mut xlib::Display,
     buf: xlib::Pixmap,
