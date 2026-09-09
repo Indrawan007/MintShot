@@ -13,9 +13,9 @@ use x11::xinerama;
 use x11::xlib;
 
 use crate::clipboard;
-use crate::selection::{bounding_box, DesktopGeometry};
 use crate::overlay;
 use crate::save;
+use crate::selection::{bounding_box, DesktopGeometry};
 
 // ─── Typed error ──────────────────────────────────────────────────────────────
 
@@ -35,7 +35,6 @@ pub enum CaptureError {
 
     /// Any other X11 or OS error.
     Other(String),
-
     // NOTE: Clipboard errors are intentionally NOT a CaptureError variant.
     // Clipboard failure is non-fatal — the file is already saved to disk.
     // Clipboard errors are logged as warnings inside take_partial_screenshot()
@@ -45,16 +44,11 @@ pub enum CaptureError {
 impl fmt::Display for CaptureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cancelled =>
-                write!(f, "screenshot cancelled by user"),
-            Self::DisplayNotFound(msg) =>
-                write!(f, "X display not available: {}", msg),
-            Self::ScreenCaptureFailed(msg) =>
-                write!(f, "screen capture failed: {}", msg),
-            Self::SaveFailed(msg) =>
-                write!(f, "failed to save PNG: {}", msg),
-            Self::Other(msg) =>
-                write!(f, "{}", msg),
+            Self::Cancelled => write!(f, "screenshot cancelled by user"),
+            Self::DisplayNotFound(msg) => write!(f, "X display not available: {}", msg),
+            Self::ScreenCaptureFailed(msg) => write!(f, "screen capture failed: {}", msg),
+            Self::SaveFailed(msg) => write!(f, "failed to save PNG: {}", msg),
+            Self::Other(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -86,8 +80,7 @@ impl XDisplay {
     fn open() -> Result<Self, CaptureError> {
         let d = unsafe { xlib::XOpenDisplay(std::ptr::null()) };
         if d.is_null() {
-            let display_env = std::env::var("DISPLAY")
-                .unwrap_or_else(|_| "(unset)".into());
+            let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| "(unset)".into());
             Err(CaptureError::DisplayNotFound(format!(
                 "XOpenDisplay failed. DISPLAY={}. Is the X server running?",
                 display_env
@@ -131,12 +124,7 @@ impl XDisplay {
         unsafe {
             let mut event_base: std::os::raw::c_int = 0;
             let mut error_base: std::os::raw::c_int = 0;
-            if xinerama::XineramaQueryExtension(
-                self.0,
-                &mut event_base,
-                &mut error_base,
-            ) == 0
-            {
+            if xinerama::XineramaQueryExtension(self.0, &mut event_base, &mut error_base) == 0 {
                 info!("Xinerama extension not present — single-screen mode");
                 return fallback;
             }
@@ -180,15 +168,22 @@ impl XDisplay {
                 return fallback;
             }
 
-            DesktopGeometry { x, y, width: w, height: h, root }
+            DesktopGeometry {
+                x,
+                y,
+                width: w,
+                height: h,
+                root,
+            }
         }
     }
 }
 
-
 impl Drop for XDisplay {
     fn drop(&mut self) {
-        unsafe { xlib::XCloseDisplay(self.0); }
+        unsafe {
+            xlib::XCloseDisplay(self.0);
+        }
         info!("X display closed");
     }
 }
@@ -200,7 +195,6 @@ impl Drop for XDisplay {
 /// Returns `Ok(filepath)` on success, or a typed `CaptureError`
 /// so `main.rs` can handle each failure mode distinctly.
 pub fn take_partial_screenshot() -> Result<String, CaptureError> {
-
     // Step 1: Open display (RAII — auto-closed at end of scope)
     let display = XDisplay::open()?;
     let geom = display.desktop_geometry();
@@ -210,8 +204,8 @@ pub fn take_partial_screenshot() -> Result<String, CaptureError> {
     );
 
     // Step 2: Show overlay — returns clean pixels + selection rect
-    let capture_result = overlay::show_selection_overlay(display.as_ptr(), &geom)
-        .map_err(CaptureError::from)?;
+    let capture_result =
+        overlay::show_selection_overlay(display.as_ptr(), &geom).map_err(CaptureError::from)?;
 
     let sel = &capture_result.selection;
     info!(
@@ -224,12 +218,8 @@ pub fn take_partial_screenshot() -> Result<String, CaptureError> {
 
     // Step 3: Save PNG — returns (filepath, png_bytes)
     // png_bytes encoded ONCE here, reused by clipboard
-    let (filepath, png_bytes) = save::save_png(
-        &capture_result.pixels,
-        sel.width,
-        sel.height,
-    )
-    .map_err(|e| CaptureError::SaveFailed(e.to_string()))?;
+    let (filepath, png_bytes) = save::save_png(&capture_result.pixels, sel.width, sel.height)
+        .map_err(|e| CaptureError::SaveFailed(e.to_string()))?;
 
     info!("Saved: {}", filepath);
 

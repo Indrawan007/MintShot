@@ -18,12 +18,12 @@ Built with Rust for maximum performance and minimal resource usage.
 
 ## Performance Comparison
 
-| Tool         | RAM (Idle) | RAM (Capture) | Startup Time |
-|-------------|-----------|---------------|-------------|
-| MintShot    | <1 MB     | ~5 MB         | <50ms       |
-| gnome-screenshot | 15 MB | 45 MB       | ~300ms      |
-| Flameshot   | 25 MB     | 60 MB         | ~500ms      |
-| Shutter     | 80 MB     | 120 MB        | ~2000ms     |
+| Tool             | RAM (Idle) | RAM (Capture) | Startup Time |
+| ---------------- | ---------- | ------------- | ------------ |
+| MintShot         | <1 MB      | ~5 MB         | <50ms        |
+| gnome-screenshot | 15 MB      | 45 MB         | ~300ms       |
+| Flameshot        | 25 MB      | 60 MB         | ~500ms       |
+| Shutter          | 80 MB      | 120 MB        | ~2000ms      |
 
 ## Download
 

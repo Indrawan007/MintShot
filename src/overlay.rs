@@ -270,7 +270,6 @@ unsafe fn run_overlay(
     // left of / above the primary one.
     let ox = geom.x;
     let oy = geom.y;
-
     let screen = xlib::XDefaultScreen(display);
     let visual = xlib::XDefaultVisual(display, screen);
     let depth = xlib::XDefaultDepth(display, screen);
@@ -442,7 +441,19 @@ unsafe fn run_overlay(
     xlib::XSync(display, xlib::False);
 
     // Initial draw
-    full_redraw(display, buf, gc, bg_clean, bg_dim, sw, sh, font, None, None, (ox, oy));
+    full_redraw(
+        display,
+        buf,
+        gc,
+        bg_clean,
+        bg_dim,
+        sw,
+        sh,
+        font,
+        None,
+        None,
+        (ox, oy),
+    );
     blit(display, buf, win, gc, sw, sh);
     xlib::XFlush(display);
 
@@ -815,7 +826,9 @@ unsafe fn full_redraw(
 
     match selection {
         Some(sel) if sel.is_valid() => {
-            draw_selection(display, buf, gc, bg_clean, sw, sh, font, sel, cursor, origin);
+            draw_selection(
+                display, buf, gc, bg_clean, sw, sh, font, sel, cursor, origin,
+            );
         }
         _ => {
             if let Some(c) = cursor {
@@ -1278,8 +1291,8 @@ mod tests {
     #[test]
     fn mask_shift_returns_offset_of_lowest_set_bit() {
         assert_eq!(mask_shift(0x00_FF_00_00), 16); // R in a 32-bit BGRX layout
-        assert_eq!(mask_shift(0x00_00_FF_00), 8);  // G
-        assert_eq!(mask_shift(0x00_00_00_FF), 0);  // B
+        assert_eq!(mask_shift(0x00_00_FF_00), 8); // G
+        assert_eq!(mask_shift(0x00_00_00_FF), 0); // B
     }
 
     #[test]

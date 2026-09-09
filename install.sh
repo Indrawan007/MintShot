@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# MintShot Installation Script v1.3.0
+# MintShot Installation Script v1.2.1
 #
 # Per-user install: NO root, NO system directories, NO systemd, NO linger.
 # Everything lives under $HOME — fully reversible with uninstall.sh.
