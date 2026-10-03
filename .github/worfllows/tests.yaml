@@ -1,0 +1,26 @@
+name: Arch Linux tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install Arch build and test tools
+        run: pacman -Syu --noconfirm --needed base-devel rust git shellcheck
+      - uses: actions/checkout@v4
+      - name: Unit and headless Wayland CLI tests
+        run: cargo test --locked
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Installer and uninstaller tests
+        run: |
+          bash -n install.sh uninstall.sh tests/install.sh
+          shellcheck install.sh uninstall.sh tests/install.sh
+          bash tests/install.sh

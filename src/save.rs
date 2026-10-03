@@ -1,135 +1,117 @@
-//! PNG file saving module
-//!
-//! FIXES:
-//!   #5  — Atomic file creation with O_EXCL (no TOCTOU race)
-//!   #10 — PNG encoded once to Vec<u8>, written to file from same buffer
-//!          (caller can reuse bytes for clipboard — zero re-encoding)
+//! Save grim's encoded PNG with an atomic, unique timestamped filename.
 
 use chrono::{DateTime, Local};
-use log::info;
+use log::{info, warn};
 use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
-
-const SAVE_DIR_NAME: &str = "Pictures/MintShot";
-
-// ─── Directory helpers ────────────────────────────────────────────────────
+use std::path::{Path, PathBuf};
 
 fn get_save_dir() -> Result<PathBuf, Box<dyn Error>> {
-    let home     = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    let save_dir = home.join(SAVE_DIR_NAME);
-    if !save_dir.exists() {
-        fs::create_dir_all(&save_dir)?;
-        info!("Created save directory: {}", save_dir.display());
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .ok_or("HOME is not set; cannot determine the screenshot directory")?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Err("HOME must be an absolute path".into());
     }
+    let save_dir = home.join("Pictures/MintShot");
+    fs::create_dir_all(&save_dir)?;
     Ok(save_dir)
 }
 
-fn generate_filename(now: &DateTime<Local>) -> String {
-    format!("mintshot_{}.png", now.format("%Y%m%d_%H%M%S%.3f"))
+/// O_CREAT|O_EXCL prevents overwrites and filename collision races.
+fn create_unique_file(
+    save_dir: &Path,
+    now: &DateTime<Local>,
+) -> Result<(fs::File, PathBuf), Box<dyn Error>> {
+    let timestamp = now.format("%Y%m%d_%H%M%S%.3f");
+    for counter in 0u32..=9_999 {
+        let filename = if counter == 0 {
+            format!("mintshot_{}.png", timestamp)
+        } else {
+            format!("mintshot_{}_{}.png", timestamp, counter)
+        };
+        let path = save_dir.join(filename);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err("Cannot create a unique filename after 10 000 attempts".into())
 }
 
-// ─── Atomic file creation (Fix #5) ───────────────────────────────────────
-
-/// Create a uniquely-named file using O_CREAT|O_EXCL (atomic).
-///
-/// This eliminates the TOCTOU race between `.exists()` and `.create()`.
-/// Returns `(File, PathBuf)` for the caller to write into.
-fn create_unique_file(
-    save_dir: &std::path::Path,
-    now:      &DateTime<Local>,
-) -> Result<(fs::File, PathBuf), Box<dyn Error>> {
-
-    // ── Attempt base name first ────────────────────────────────────────────
-    let base = save_dir.join(generate_filename(now));
-    match OpenOptions::new().write(true).create_new(true).open(&base) {
-        Ok(f)  => return Ok((f, base)),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.into()),
+/// Only called for a newly-created file owned by this capture. Do not leave
+/// empty/partial screenshots behind if writing or flushing fails (e.g. ENOSPC).
+fn write_png(file: fs::File, path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
+    let result = writer.write_all(bytes).and_then(|()| writer.flush());
+    drop(writer);
+    if let Err(error) = result {
+        if let Err(cleanup_error) = fs::remove_file(path) {
+            warn!("Could not remove partial screenshot {}: {}", path.display(), cleanup_error);
+        }
+        return Err(error.into());
     }
+    Ok(())
+}
 
-    // ── Collision: append counter ──────────────────────────────────────────
-    for counter in 1u32..=9_999 {
-        let path = save_dir.join(format!(
-            "mintshot_{}_{}.png",
-            now.format("%Y%m%d_%H%M%S%.3f"),
-            counter,
-        ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(f)  => return Ok((f, path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
+/// Save the exact PNG from grim, without pixel conversion or re-encoding.
+pub fn save_encoded_png(png_bytes: &[u8]) -> Result<String, Box<dyn Error>> {
+    let save_dir = get_save_dir()?;
+    let (file, filepath) = create_unique_file(&save_dir, &Local::now())?;
+    write_png(file, &filepath, png_bytes)?;
+
+    let path = filepath.to_string_lossy().to_string();
+    info!("Saved: {} ({} bytes)", path, png_bytes.len());
+    Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("mintshot-save-{}-{}", std::process::id(), nonce));
+            fs::create_dir(&path).unwrap();
+            Self(path)
         }
     }
 
-    Err("Cannot create a unique filename after 9 999 attempts".into())
-}
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
-// ─── PNG encoder (Fix #10) ────────────────────────────────────────────────
+    #[test]
+    fn timestamp_collisions_do_not_overwrite_previous_images() {
+        let directory = TestDir::new();
+        let now = Local::now();
+        let (first, first_path) = create_unique_file(&directory.0, &now).unwrap();
+        write_png(first, &first_path, b"first image").unwrap();
+        let (second, second_path) = create_unique_file(&directory.0, &now).unwrap();
+        write_png(second, &second_path, b"second image").unwrap();
+        assert_ne!(first_path, second_path);
+        assert_eq!(fs::read(first_path).unwrap(), b"first image".to_vec());
+        assert_eq!(fs::read(second_path).unwrap(), b"second image".to_vec());
+    }
 
-/// Encode RGBA pixels to a PNG byte vector.
-///
-/// Encoding is done ONCE here. The same `Vec<u8>` is written to disk
-/// AND returned to the caller so the clipboard module can reuse it
-/// directly — no second encode pass needed.
-fn encode_png_to_vec(
-    pixels: &[u8],
-    width:  u32,
-    height: u32,
-) -> Result<Vec<u8>, Box<dyn Error>> {
-    // Pre-size buffer: PNG overhead is small, start at ~half raw size
-    let mut buf = Vec::with_capacity(pixels.len() / 2);
-
-    let mut encoder = png::Encoder::new(&mut buf, width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_compression(png::Compression::Fast);
-    encoder.set_filter(png::FilterType::Sub);
-
-    let mut writer = encoder.write_header()?;
-    writer.write_image_data(pixels)?;
-    writer.finish()?;
-
-    Ok(buf)
-}
-
-// ─── Public API ───────────────────────────────────────────────────────────
-
-/// Save RGBA pixels as a PNG file.
-///
-/// Returns `(file_path, png_bytes)`.
-///
-/// The caller (capture.rs) passes `png_bytes` directly to the clipboard
-/// module, avoiding a second encode pass.
-///
-/// # Errors
-/// - Home directory not available
-/// - Filesystem permission error
-/// - PNG encoding error
-pub fn save_png(
-    pixels: &[u8],
-    width:  u32,
-    height: u32,
-) -> Result<(String, Vec<u8>), Box<dyn Error>> {
-
-    let save_dir = get_save_dir()?;
-    let now      = Local::now();
-
-    // ── Encode once ────────────────────────────────────────────────────────
-    let png_bytes = encode_png_to_vec(pixels, width, height)?;
-
-    // ── Atomic create (Fix #5) ─────────────────────────────────────────────
-    let (file, filepath) = create_unique_file(&save_dir, &now)?;
-
-    // ── Write encoded bytes to file ────────────────────────────────────────
-    let mut writer = BufWriter::with_capacity(64 * 1024, file);
-    writer.write_all(&png_bytes)?;
-    writer.flush()?;
-
-    let path_str = filepath.to_string_lossy().to_string();
-    info!("Saved: {} ({} bytes)", path_str, png_bytes.len());
-
-    // ✅ Fix #10: return png_bytes for clipboard reuse
-    Ok((path_str, png_bytes))
+    #[test]
+    fn failed_flush_removes_the_incomplete_file() {
+        let directory = TestDir::new();
+        let (file, path) = create_unique_file(&directory.0, &Local::now()).unwrap();
+        drop(file);
+        // A read-only fd deterministically fails during the buffered flush,
+        // without needing to fill a disk or depend on the test runner's uid.
+        let read_only = fs::File::open(&path).unwrap();
+        assert!(write_png(read_only, &path, b"partial PNG").is_err());
+        assert!(!path.exists());
+    }
 }

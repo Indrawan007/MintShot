@@ -1,254 +1,178 @@
-//! Main capture orchestration module
+//! Region capture for Hyprland through grim and slurp.
 //!
-//! Flow:
-//!   1. Open display (RAII — auto-closed)
-//!   2. Show overlay → pre-overlay pixels + selection rect
-//!   3. Save PNG → file path + png_bytes (encoded once)
-//!   4. Copy png_bytes to clipboard (no re-encode)
-//!   5. Desktop notification
+//! slurp owns the selection overlay; grim reads the compositor's screencopy
+//! protocol. XWayland is deliberately not used. The encoded PNG is shared
+//! between the unique-file saver and wl-copy without re-encoding.
 
 use log::{info, warn};
+use std::io::Cursor;
+use std::process::{Command, Output, Stdio};
+
 use std::fmt;
-use x11::xinerama;
-use x11::xlib;
-
-use crate::clipboard;
-use crate::overlay;
-use crate::save;
-use crate::selection::{bounding_box, DesktopGeometry};
-
-// ─── Typed error ──────────────────────────────────────────────────────────────
+use crate::{clipboard, save};
 
 #[derive(Debug)]
 pub enum CaptureError {
-    /// User pressed ESC / Q / Right-click — normal exit, not an error.
     Cancelled,
-
-    /// XOpenDisplay returned null — DISPLAY not set or X server not running.
-    DisplayNotFound(String),
-
-    /// XGetImage failed — screen capture step failed.
     ScreenCaptureFailed(String),
-
-    /// PNG encoding or file write failed.
     SaveFailed(String),
-
-    /// Any other X11 or OS error.
-    Other(String),
-    // NOTE: Clipboard errors are intentionally NOT a CaptureError variant.
-    // Clipboard failure is non-fatal — the file is already saved to disk.
-    // Clipboard errors are logged as warnings inside take_partial_screenshot()
-    // and do NOT abort the capture flow.
 }
 
 impl fmt::Display for CaptureError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cancelled => write!(f, "screenshot cancelled by user"),
-            Self::DisplayNotFound(msg) => write!(f, "X display not available: {}", msg),
-            Self::ScreenCaptureFailed(msg) => write!(f, "screen capture failed: {}", msg),
-            Self::SaveFailed(msg) => write!(f, "failed to save PNG: {}", msg),
-            Self::Other(msg) => write!(f, "{}", msg),
+            Self::Cancelled => write!(formatter, "screenshot cancelled by user"),
+            Self::ScreenCaptureFailed(message) => write!(formatter, "screen capture failed: {}", message),
+            Self::SaveFailed(message) => write!(formatter, "failed to save PNG: {}", message),
         }
     }
 }
 
 impl std::error::Error for CaptureError {}
 
-impl From<Box<dyn std::error::Error>> for CaptureError {
-    fn from(e: Box<dyn std::error::Error>) -> Self {
-        let msg = e.to_string();
-        if msg.contains("cancelled") || msg.contains("Selection cancelled") {
-            Self::Cancelled
-        } else if msg.contains("X display") || msg.contains("XOpenDisplay") {
-            Self::DisplayNotFound(msg)
-        } else if msg.contains("XGetImage") || msg.contains("capture background") {
-            Self::ScreenCaptureFailed(msg)
-        } else {
-            Self::Other(msg)
+const INSTALL_HINT: &str = "On Arch: sudo pacman -S --needed grim slurp wl-clipboard";
+
+#[derive(Debug, PartialEq, Eq)]
+struct Region {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+impl Region {
+    fn parse(text: &str) -> Result<Self, CaptureError> {
+        let invalid = || {
+            CaptureError::ScreenCaptureFailed(format!("Invalid region from slurp: {:?}", text))
+        };
+        let mut fields = text.split_whitespace();
+        let position = fields.next().ok_or_else(invalid)?;
+        let size = fields.next().ok_or_else(invalid)?;
+        if fields.next().is_some() {
+            return Err(invalid());
         }
+        let (x, y) = position.split_once(',').ok_or_else(invalid)?;
+        let (width, height) = size.split_once('x').ok_or_else(invalid)?;
+        let x = x.parse::<i32>().map_err(|_| invalid())?;
+        let y = y.parse::<i32>().map_err(|_| invalid())?;
+        let width = width.parse::<u32>().map_err(|_| invalid())?;
+        let height = height.parse::<u32>().map_err(|_| invalid())?;
+        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+            return Err(invalid());
+        }
+        if x.checked_add(width as i32).is_none() || y.checked_add(height as i32).is_none() {
+            return Err(invalid());
+        }
+        Ok(Self {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    fn geometry(&self) -> String {
+        format!("{},{} {}x{}", self.x, self.y, self.width, self.height)
     }
 }
 
-// ─── RAII display wrapper ─────────────────────────────────────────────────────
-
-/// Owns an X11 Display connection.
-/// Automatically calls `XCloseDisplay` when dropped.
-struct XDisplay(*mut xlib::Display);
-
-impl XDisplay {
-    fn open() -> Result<Self, CaptureError> {
-        let d = unsafe { xlib::XOpenDisplay(std::ptr::null()) };
-        if d.is_null() {
-            let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| "(unset)".into());
-            Err(CaptureError::DisplayNotFound(format!(
-                "XOpenDisplay failed. DISPLAY={}. Is the X server running?",
-                display_env
-            )))
-        } else {
-            Ok(Self(d))
-        }
-    }
-
-    fn as_ptr(&self) -> *mut xlib::Display {
-        self.0
-    }
-
-    /// Bounding box of every active Xinerama screen (Fix #21).
-    ///
-    /// `XDisplayWidth`/`XDisplayHeight` describe the *default screen* only.
-    /// On a multi-monitor setup that meant the overlay covered a single
-    /// monitor, and monitors placed left of or above the primary one — whose
-    /// root coordinates are negative — were unreachable entirely.
-    ///
-    /// Falls back to the default screen when Xinerama is absent or inactive,
-    /// which keeps single-head systems behaving exactly as before.
-    fn desktop_geometry(&self) -> DesktopGeometry {
-        let (default_w, default_h, root) = unsafe {
-            let screen = xlib::XDefaultScreen(self.0);
-            (
-                xlib::XDisplayWidth(self.0, screen) as u32,
-                xlib::XDisplayHeight(self.0, screen) as u32,
-                xlib::XRootWindow(self.0, screen),
-            )
-        };
-
-        let fallback = DesktopGeometry {
-            x: 0,
-            y: 0,
-            width: default_w,
-            height: default_h,
-            root,
-        };
-
-        unsafe {
-            let mut event_base: std::os::raw::c_int = 0;
-            let mut error_base: std::os::raw::c_int = 0;
-            if xinerama::XineramaQueryExtension(self.0, &mut event_base, &mut error_base) == 0 {
-                info!("Xinerama extension not present — single-screen mode");
-                return fallback;
-            }
-            if xinerama::XineramaIsActive(self.0) == 0 {
-                info!("Xinerama not active — single-screen mode");
-                return fallback;
-            }
-
-            let mut count: std::os::raw::c_int = 0;
-            let infos = xinerama::XineramaQueryScreens(self.0, &mut count);
-            if infos.is_null() || count <= 0 {
-                warn!("XineramaQueryScreens returned nothing — single-screen mode");
-                return fallback;
-            }
-
-            let mut screens = Vec::with_capacity(count as usize);
-            for i in 0..count as isize {
-                let s = &*infos.offset(i);
-                let rect = (
-                    s.x_org as i32,
-                    s.y_org as i32,
-                    s.width.max(0) as u32,
-                    s.height.max(0) as u32,
-                );
-                info!(
-                    "  screen {}: {}x{} at ({}, {})",
-                    s.screen_number, rect.2, rect.3, rect.0, rect.1
-                );
-                screens.push(rect);
-            }
-            xlib::XFree(infos as *mut std::os::raw::c_void);
-
-            let (x, y, w, h) = match bounding_box(&screens) {
-                Some(b) => b,
-                None => return fallback,
+fn run_tool(tool: &str, args: &[&str]) -> Result<Output, CaptureError> {
+    Command::new(tool)
+        .args(args)
+        // slurp can read predefined rectangles from stdin; this mode is
+        // interactive selection only, so never consume the caller's stdin.
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            let hint = if error.kind() == std::io::ErrorKind::NotFound {
+                format!(". {}", INSTALL_HINT)
+            } else {
+                String::new()
             };
-
-            // A degenerate box would produce a 0-area XGetImage.
-            if w == 0 || h == 0 {
-                warn!("Xinerama bounding box is empty — single-screen mode");
-                return fallback;
-            }
-
-            DesktopGeometry {
-                x,
-                y,
-                width: w,
-                height: h,
-                root,
-            }
-        }
-    }
+            CaptureError::ScreenCaptureFailed(format!("Cannot run {}: {}{}", tool, error, hint))
+        })
 }
 
-impl Drop for XDisplay {
-    fn drop(&mut self) {
-        unsafe {
-            xlib::XCloseDisplay(self.0);
-        }
-        info!("X display closed");
-    }
+fn tool_failure(tool: &str, output: &Output) -> CaptureError {
+    CaptureError::ScreenCaptureFailed(format!(
+        "{} failed ({}): {}. Wayland capture requires screencopy and layer-shell support (Hyprland)",
+        tool,
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
 }
 
-// ─── Public entry point ───────────────────────────────────────────────────────
+fn select_region() -> Result<Region, CaptureError> {
+    let output = run_tool("slurp", &["-f", "%x,%y %wx%h"])?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // slurp uses exit 1 both for Escape and real errors. Do not hide
+        // connection/protocol failures as a successful cancellation.
+        if output.status.code() == Some(1)
+            && output.stdout.is_empty()
+            && stderr.trim() == "selection cancelled"
+        {
+            return Err(CaptureError::Cancelled);
+        }
+        return Err(tool_failure("slurp", &output));
+    }
+    let text = std::str::from_utf8(&output.stdout).map_err(|error| {
+        CaptureError::ScreenCaptureFailed(format!("Invalid UTF-8 from slurp: {}", error))
+    })?;
+    Region::parse(text)
+}
 
-/// Take a partial screenshot — main entry point.
-///
-/// Returns `Ok(filepath)` on success, or a typed `CaptureError`
-/// so `main.rs` can handle each failure mode distinctly.
+fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), CaptureError> {
+    let invalid_png = |error: png::DecodingError| {
+        CaptureError::ScreenCaptureFailed(format!("grim returned an invalid PNG: {}", error))
+    };
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.ignore_checksums(false);
+    let mut reader = decoder.read_info().map_err(invalid_png)?;
+    if reader.info().animation_control.is_some() {
+        return Err(CaptureError::ScreenCaptureFailed(
+            "grim returned an animated PNG; expected a still screenshot".into(),
+        ));
+    }
+    let dimensions = (reader.info().width, reader.info().height);
+    // read_info stops before pixel data. Check all rows and IEND as well,
+    // otherwise truncated/corrupt PNGs can be saved and reported as success.
+    // Row-wise decoding avoids allocating another full-size pixel buffer.
+    while reader.next_row().map_err(invalid_png)?.is_some() {}
+    reader.finish().map_err(invalid_png)?;
+    // slurp uses logical coordinates; the PNG reports actual scaled pixels.
+    Ok(dimensions)
+}
+
 pub fn take_partial_screenshot() -> Result<String, CaptureError> {
-    // Step 1: Open display (RAII — auto-closed at end of scope)
-    let display = XDisplay::open()?;
-    let geom = display.desktop_geometry();
-    info!(
-        "Desktop: {}x{} at ({}, {})",
-        geom.width, geom.height, geom.x, geom.y
-    );
+    let region = select_region()?;
+    let geometry = region.geometry();
+    info!("Wayland selection: {}", geometry);
 
-    // Step 2: Show overlay — returns clean pixels + selection rect
-    let capture_result =
-        overlay::show_selection_overlay(display.as_ptr(), &geom).map_err(CaptureError::from)?;
+    // No shell interpolation: the entire signed geometry is one argument.
+    // slurp has unmapped its overlay before it exits, so it isn't captured.
+    let output = run_tool("grim", &["-t", "png", "-g", &geometry, "-"])?;
+    if !output.status.success() {
+        return Err(tool_failure("grim", &output));
+    }
+    let (width, height) = png_dimensions(&output.stdout)?;
+    let filepath = save::save_encoded_png(&output.stdout)
+        .map_err(|error| CaptureError::SaveFailed(error.to_string()))?;
 
-    let sel = &capture_result.selection;
-    info!(
-        "Selection: {}x{} at ({}, {})",
-        sel.width, sel.height, sel.x, sel.y
-    );
-
-    // Display auto-closes here (Drop) — after overlay is fully done
-    drop(display);
-
-    // Step 3: Save PNG — returns (filepath, png_bytes)
-    // png_bytes encoded ONCE here, reused by clipboard
-    let (filepath, png_bytes) = save::save_png(&capture_result.pixels, sel.width, sel.height)
-        .map_err(|e| CaptureError::SaveFailed(e.to_string()))?;
-
-    info!("Saved: {}", filepath);
-
-    // Step 4: Copy to clipboard — reuse png_bytes (no re-encode)
-    // Clipboard failure is non-fatal — file is already saved
-    let clipboard_ok = match clipboard::copy_to_clipboard(
-        &png_bytes,
-        &capture_result.pixels,
-        sel.width,
-        sel.height,
-        &filepath,
-    ) {
+    // A missing/broken clipboard must not discard a successfully saved image.
+    let clipboard_ok = match clipboard::copy_png(&output.stdout) {
         Ok(()) => {
-            info!("Copied to clipboard — Ctrl+V ready!");
+            info!("Clipboard: wl-copy image/png ✓");
             true
         }
-        Err(e) => {
-            warn!("Clipboard failed: {} (file still saved)", e);
+        Err(error) => {
+            warn!("Wayland clipboard failed: {} (file still saved)", error);
             false
         }
     };
-
-    // Step 5: Desktop notification (non-blocking)
-    send_notification(&filepath, sel.width, sel.height, clipboard_ok);
-
+    send_notification(&filepath, width, height, clipboard_ok);
     Ok(filepath)
 }
-
-// ─── Desktop notification ─────────────────────────────────────────────────────
 
 fn send_notification(filepath: &str, w: u32, h: u32, clipboard_ok: bool) {
     let status = if clipboard_ok {
@@ -268,5 +192,77 @@ fn send_notification(filepath: &str, w: u32, h: u32, clipboard_ok: bool) {
             "MintShot — Screenshot Captured ✓",
             &body,
         ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_monitor_coordinates_are_preserved() {
+        let region = Region::parse("-1920,-1080 3840x2160\n").unwrap();
+        assert_eq!(region.geometry(), "-1920,-1080 3840x2160");
+    }
+
+    #[test]
+    fn malformed_or_empty_regions_are_rejected() {
+        for text in [
+            "",
+            "0,0",
+            "0,0 0x10",
+            "0,0 10x0",
+            "0,0 -1x10",
+            "x,y 10x10",
+            "0,0 10x10 extra",
+            "0,0 2147483648x10",
+            "2147483647,0 1x1",
+            "0,2147483647 1x1",
+            "0,0 10x10; touch /tmp/unwanted",
+        ] {
+            assert!(Region::parse(text).is_err(), "accepted {:?}", text);
+        }
+    }
+
+    #[test]
+    fn png_dimensions_use_pixels_not_logical_selection_size() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 4, 6);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[0; 4 * 6 * 4]).unwrap();
+            writer.finish().unwrap();
+        }
+        assert_eq!(png_dimensions(&bytes).unwrap(), (4, 6));
+        assert!(png_dimensions(b"not a PNG").is_err());
+        assert!(png_dimensions(b"").is_err());
+        // Valid header and pixel data, but no IEND: previously accepted.
+        assert!(png_dimensions(&bytes[..bytes.len() - 12]).is_err());
+        // A corrupt IDAT checksum must not be copied/saved as a good PNG.
+        let mut corrupt = bytes.clone();
+        let idat = corrupt.windows(4).position(|chunk| chunk == b"IDAT").unwrap();
+        let length = u32::from_be_bytes(corrupt[idat - 4..idat].try_into().unwrap()) as usize;
+        corrupt[idat + 4 + length] ^= 1;
+        assert!(png_dimensions(&corrupt).is_err());
+    }
+    #[test]
+    fn animated_payloads_are_not_accepted_as_still_screenshots() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_animated(1, 0).unwrap();
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[0; 4]).unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(png_dimensions(&bytes).is_err());
+    }
+
 }

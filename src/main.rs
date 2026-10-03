@@ -1,19 +1,13 @@
-//! MintShot — Lightweight Partial Screenshot Tool for Linux Mint
-//!
-//! Hotkey : Ctrl+Shift+S
-//! Modes  : direct capture (default) | background daemon (--daemon)
+//! MintShot — partial screenshots for Arch Linux + Hyprland (Wayland only).
 
 mod capture;
 mod clipboard;
-mod hotkey;
-mod overlay;
 mod save;
-mod selection;
 
-use log::{error, info, warn};
+use capture::CaptureError;
+use log::{error, info};
+use std::ffi::{OsStr, OsString};
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 fn main() {
     env_logger::Builder::from_env(
@@ -23,203 +17,153 @@ fn main() {
     .format_module_path(false)
     .init();
 
-    info!(
-        "MintShot {} — Partial Screenshot Tool",
-        env!("CARGO_PKG_VERSION")
-    );
-
-    // Validate display server before doing anything
-    check_display_server();
-
-    let args: Vec<String> = std::env::args().collect();
-
-    match args.get(1).map(String::as_str) {
-        // Explicit capture or no args → take screenshot
-        Some("--capture") | None => run_capture(),
-
-        // Background hotkey daemon
-        Some("--daemon") => run_daemon(),
-
-        // Version info
-        Some("--version") | Some("-v") => {
-            println!("MintShot v{}", env!("CARGO_PKG_VERSION"));
-            println!("Lightweight partial screenshot tool for Linux");
-            process::exit(0);
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let mode = match parse_args(&args) {
+        Ok(mode) => mode,
+        Err(message) => {
+            eprintln!("mintshot: {}", message);
+            eprintln!("Run 'mintshot --help' for usage. Shortcuts are configured in Hyprland.");
+            process::exit(1);
         }
-
-        // Help
-        Some("--help") | Some("-h") => {
+    };
+    let code = match mode {
+        Mode::Capture => run_capture(),
+        Mode::Version => {
+            println!("MintShot v{} — Arch Linux + Hyprland", env!("CARGO_PKG_VERSION"));
+            0
+        }
+        Mode::Help => {
             print_help();
-            process::exit(0);
+            0
         }
+    };
+    process::exit(code);
+}
 
-        // Unknown argument — do not silently ignore
-        Some(unknown) => {
-            eprintln!("mintshot: unknown option '{}'", unknown);
-            eprintln!("Run 'mintshot --help' for usage.");
-            process::exit(1);
-        }
+#[derive(Debug, PartialEq, Eq)]
+enum Mode {
+    Capture,
+    Version,
+    Help,
+}
+
+fn parse_args(args: &[OsString]) -> Result<Mode, String> {
+    match args {
+        [] => Ok(Mode::Capture),
+        [argument] => match argument.to_str() {
+            Some("--capture") => Ok(Mode::Capture),
+            Some("--version" | "-v") => Ok(Mode::Version),
+            Some("--help" | "-h") => Ok(Mode::Help),
+            _ => Err(format!("unknown option '{}'", argument.to_string_lossy())),
+        },
+        [_, extra, ..] => Err(format!("unexpected extra argument '{}'", extra.to_string_lossy())),
     }
 }
 
-// ─── Display server check ──────────────────────────────────────────────────
-
-fn check_display_server() {
-    let wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
-    let x11     = std::env::var("DISPLAY").is_ok();
-
-    match (wayland, x11) {
-        (true, false) => {
-            eprintln!("ERROR: Pure Wayland session detected.");
-            eprintln!("MintShot requires X11 or XWayland.");
-            eprintln!("Hint: Enable XWayland, or set DISPLAY=:0");
-            process::exit(1);
-        }
-        (true, true) => {
-            warn!("Wayland + XWayland detected — using XWayland mode.");
-        }
-        (false, true) => {
-            info!("X11 session detected.");
-        }
-        (false, false) => {
-            eprintln!("ERROR: No display server detected.");
-            eprintln!("DISPLAY and WAYLAND_DISPLAY are both unset.");
-            process::exit(1);
-        }
-    }
+fn is_wayland_session(display: Option<&OsStr>, session_type: Option<&OsStr>) -> bool {
+    display.is_some_and(|value| !value.is_empty())
+        || session_type == Some(OsStr::new("wayland"))
 }
 
-// ─── Capture mode ─────────────────────────────────────────────────────────
-
-/// Take one screenshot and exit.
-fn run_capture() {
-    info!("Starting capture session...");
+fn run_capture() -> i32 {
+    let display = std::env::var_os("WAYLAND_DISPLAY");
+    let session_type = std::env::var_os("XDG_SESSION_TYPE");
+    if !is_wayland_session(display.as_deref(), session_type.as_deref()) {
+        error!("A Wayland session is required. Run MintShot inside Hyprland.");
+        return 2;
+    }
 
     match capture::take_partial_screenshot() {
-        // ── Success ───────────────────────────────────────────────────────
         Ok(path) => {
             info!("Screenshot saved: {}", path);
-            process::exit(0);
+            0
         }
-
-        // ── User cancelled — normal exit ──────────────────────────────────
-        Err(capture::CaptureError::Cancelled) => {
+        Err(CaptureError::Cancelled) => {
             info!("Screenshot cancelled by user.");
-            process::exit(0);
+            0
         }
-
-        // ── X display not available ────────────────────────────────────────
-        Err(capture::CaptureError::DisplayNotFound(msg)) => {
-            error!("Display not available: {}", msg);
-            error!("Make sure DISPLAY is set and X server is running.");
-            process::exit(2);
+        Err(CaptureError::ScreenCaptureFailed(message)) => {
+            error!("Screen capture failed: {}", message);
+            error!("Check grim/slurp and Hyprland's screencopy/layer-shell support.");
+            3
         }
-
-        // ── Screen capture failed ──────────────────────────────────────────
-        Err(capture::CaptureError::ScreenCaptureFailed(msg)) => {
-            error!("Screen capture failed: {}", msg);
-            error!("Try: DISPLAY=:0 mintshot");
-            process::exit(3);
-        }
-
-        // ── PNG save failed ────────────────────────────────────────────────
-        Err(capture::CaptureError::SaveFailed(msg)) => {
-            error!("Failed to save screenshot: {}", msg);
-            error!("Check disk space: df -h ~/Pictures");
-            process::exit(4);
-        }
-
-        // ── Any other error ────────────────────────────────────────────────
-        Err(e) => {
-            error!("Screenshot failed: {}", e);
-            process::exit(1);
+        Err(CaptureError::SaveFailed(message)) => {
+            error!("Failed to save screenshot: {}", message);
+            error!("Check HOME, permissions and free space in ~/Pictures.");
+            4
         }
     }
 }
-
-// ─── Help text ────────────────────────────────────────────────────────────
 
 fn print_help() {
     println!(
-        "MintShot v{} — Lightweight Partial Screenshot Tool",
+        "\
+MintShot v{} — Arch Linux + Hyprland (Wayland only)
+
+USAGE:
+  mintshot [--capture | --version | --help]
+
+  (no args) / --capture   Select a region, save PNG and copy to clipboard
+  --version / -v         Show version
+  --help / -h            Show this help
+
+REQUIRES:
+  grim, slurp; wl-copy (wl-clipboard) for the image clipboard
+  notify-send (libnotify) is optional
+
+HYPRLAND SHORTCUT (~/.config/hypr/hyprland.conf):
+  bind = CTRL SHIFT, S, exec, ~/.local/bin/mintshot --capture
+  No daemon or autostart needed. Drag and release to capture; Escape cancels.
+
+FILES:
+  ~/Pictures/MintShot/   Unique timestamped PNG files
+
+EXIT CODES:
+  0   Success or cancelled
+  1   Invalid option
+  2   Wayland session not available
+  3   Selection/capture failed
+  4   File save failed
+
+Clipboard failures do not discard the saved screenshot.",
         env!("CARGO_PKG_VERSION")
     );
-    println!();
-    println!("USAGE:");
-    println!("  mintshot [OPTIONS]");
-    println!();
-    println!("OPTIONS:");
-    println!("  (no args)    Take a screenshot immediately");
-    println!("  --capture    Same as no args");
-    println!("  --daemon     Run as background hotkey listener");
-    println!("  --version    Show version");
-    println!("  --help       Show this help");
-    println!();
-    println!("HOTKEY (daemon mode):");
-    println!("  Ctrl+Shift+S    Take screenshot");
-    println!();
-    println!("CONTROLS (during capture):");
-    println!("  Click+Drag      Select region");
-    println!("  Release         Confirm & save");
-    println!("  Enter           Confirm current selection");
-    println!("  ESC / Q         Cancel");
-    println!("  Right Click     Cancel");
-    println!();
-    println!("FILES:");
-    println!("  ~/Pictures/MintShot/    Screenshot save directory");
-    println!();
-    println!("EXIT CODES:");
-    println!("  0    Success or user cancelled");
-    println!("  1    General error");
-    println!("  2    X display not available");
-    println!("  3    Screen capture failed");
-    println!("  4    File save failed");
-    println!();
-    println!("Screenshots are auto-copied to clipboard (Ctrl+V ready).");
 }
 
-// ─── Daemon mode ──────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Run as background daemon listening for Ctrl+Shift+S.
-fn run_daemon() {
-    let running = Arc::new(AtomicBool::new(true));
-
-    // Signal handlers — set flag to FALSE so event loop exits cleanly
-    let r1 = Arc::clone(&running);
-    let r2 = Arc::clone(&running);
-
-    unsafe {
-        signal_hook::low_level::register(
-            signal_hook::consts::SIGINT,
-            move || { r1.store(false, Ordering::SeqCst); },
-        )
-        .expect("Failed to register SIGINT handler");
-
-        signal_hook::low_level::register(
-            signal_hook::consts::SIGTERM,
-            move || { r2.store(false, Ordering::SeqCst); },
-        )
-        .expect("Failed to register SIGTERM handler");
+    #[test]
+    fn cli_options_and_aliases_are_parsed() {
+        assert_eq!(parse_args(&[]).unwrap(), Mode::Capture);
+        for (argument, expected) in [
+            ("--capture", Mode::Capture),
+            ("--version", Mode::Version),
+            ("-v", Mode::Version),
+            ("--help", Mode::Help),
+            ("-h", Mode::Help),
+        ] {
+            assert_eq!(parse_args(&[OsString::from(argument)]).unwrap(), expected);
+        }
+        assert!(parse_args(&[OsString::from("--daemon")]).is_err());
+        assert!(parse_args(&[OsString::from("--capture"), OsString::from("--bad")]).is_err());
     }
 
-    info!("MintShot daemon started. Listening for Ctrl+Shift+S…");
-    info!("Send SIGINT (Ctrl+C) or SIGTERM to stop.");
+    #[test]
+    fn wayland_display_is_enough() {
+        assert!(is_wayland_session(Some(OsStr::new("wayland-1")), None));
+    }
 
-    match hotkey::listen_hotkey(running) {
-        Ok(()) => {
-            info!("MintShot daemon stopped cleanly.");
-        }
-        Err(hotkey::HotkeyError::Conflict) => {
-            // Another app owns Ctrl+Shift+S — expected condition.
-            // Exit 0 so a supervisor does not restart us in a loop.
-            warn!(
-                "Ctrl+Shift+S is already bound by another application."
-            );
-            warn!("Daemon exits without retry.");
-        }
-        Err(hotkey::HotkeyError::Other(e)) => {
-            error!("Hotkey listener error: {}", e);
-            process::exit(1);
-        }
+    #[test]
+    fn wayland_session_type_is_enough() {
+        assert!(is_wayland_session(None, Some(OsStr::new("wayland"))));
+    }
+
+    #[test]
+    fn headless_or_x11_sessions_are_rejected() {
+        assert!(!is_wayland_session(None, None));
+        assert!(!is_wayland_session(None, Some(OsStr::new("x11"))));
+        assert!(!is_wayland_session(Some(OsStr::new("")), None));
     }
 }
