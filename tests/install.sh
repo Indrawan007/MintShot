@@ -90,6 +90,7 @@ run_installer
 grep -Fq "Exec=\"$CASE/home with spaces/.local/bin/mintshot\" --capture" \
     "$CASE/home with spaces/.local/share/applications/mintshot.desktop"
 grep -Fq "bind = CTRL SHIFT, S, exec, \"$CASE/home with spaces/.local/bin/mintshot\" --capture" "$CASE/output"
+grep -Fq "hl.bind(\"CTRL + SHIFT + S\", hl.dsp.exec_cmd(\"$CASE/home with spaces/.local/bin/mintshot --capture\"))" "$CASE/output"
 grep -Fq '# keep my bindings' "$CASE/home with spaces/.config/hypr/hyprland.conf"
 assert_no_staging_files
 printf 'PASS: Per-user install supports spaces, verifies binary and never starts helpers/daemon\n'

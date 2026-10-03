@@ -45,19 +45,43 @@ an existing directory.
 It can install without a running compositor; taking a screenshot requires a
 Wayland desktop session.
 
-Add to `~/.config/hypr/hyprland.conf` (or your sourced bindings file):
+Add **one** of the following bindings, depending on your Hyprland config format.
+Use the exact path printed by the installer if it differs from `~/.local/bin/mintshot`.
+
+**Hyprland ≥ 0.55 (Lua config, `~/.config/hypr/hyprland.lua` or a file it
+`require()`s):** since 0.55, hyprlang is deprecated and Hyprland uses Lua for
+its config.
+
+```lua
+hl.bind("CTRL + SHIFT + S", hl.dsp.exec_cmd("~/.local/bin/mintshot --capture"))
+```
+
+**Hyprland ≤ 0.54 (legacy hyprlang, `~/.config/hypr/hyprland.conf` or a
+sourced bindings file):**
 
 ```ini
 bind = CTRL SHIFT, S, exec, ~/.local/bin/mintshot --capture
 ```
 
-Use the exact path printed by the installer if it differs. Remove conflicting
-Ctrl+Shift+S bindings and run `hyprctl reload`. No `exec-once` is needed.
+If `hyprland.lua` exists, Hyprland loads it instead of `hyprland.conf` — a
+binding left only in the `.conf` file will never run. Dotfiles frameworks
+(e.g. end-4/dots-hyprland, Omarchy ≥ 4) usually provide a `custom/` or
+`bindings.lua` override file; add the `hl.bind(...)` line there instead of
+editing the framework's core files, so it survives upstream updates.
+
+Remove conflicting Ctrl+Shift+S bindings, then save — Lua configs reload
+automatically — or run `hyprctl reload`. No `exec-once` is needed.
 
 ```bash
 ~/.local/bin/mintshot --capture
 ~/.local/bin/mintshot --help
 ```
+
+### Feature: v2.5.0
+
+- Document the `hl.bind(...)`/`hl.dsp.exec_cmd(...)` Lua keybind syntax for
+  Hyprland >= 0.55, alongside the legacy hyprlang `bind = ...` syntax, in the
+  README, `install.sh`'s post-install output, and `mintshot --help`.
 
 ### Breaking Change: v2.4.1
 

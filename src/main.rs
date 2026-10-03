@@ -111,8 +111,11 @@ REQUIRES:
   grim, slurp; wl-copy (wl-clipboard) for the image clipboard
   notify-send (libnotify) is optional
 
-HYPRLAND SHORTCUT (~/.config/hypr/hyprland.conf):
-  bind = CTRL SHIFT, S, exec, ~/.local/bin/mintshot --capture
+HYPRLAND SHORTCUT (add one, matching your config format):
+  Lua, Hyprland >= 0.55 (~/.config/hypr/hyprland.lua):
+    hl.bind(\"CTRL + SHIFT + S\", hl.dsp.exec_cmd(\"~/.local/bin/mintshot --capture\"))
+  hyprlang, Hyprland <= 0.54 (~/.config/hypr/hyprland.conf):
+    bind = CTRL SHIFT, S, exec, ~/.local/bin/mintshot --capture
   No daemon or autostart needed. Drag and release to capture; Escape cancels.
 
 FILES:

@@ -121,9 +121,13 @@ if ! rm -f -- "$HOME/.config/autostart/$APP_NAME-daemon.desktop"; then
 fi
 
 printf '\nInstalled: %s/%s\n' "$BIN_DIR" "$APP_NAME"
-printf 'Hyprland binding (~/.config/hypr/hyprland.conf):\n'
-printf '  bind = CTRL SHIFT, S, exec, "%s/%s" --capture\n' "$BIN_DIR" "$APP_NAME"
+printf 'Hyprland binding — add ONE of these depending on your config format:\n'
+printf '  Hyprland >= 0.55, Lua config (~/.config/hypr/hyprland.lua):\n'
+printf '    hl.bind("CTRL + SHIFT + S", hl.dsp.exec_cmd("%s/%s --capture"))\n' "$BIN_DIR" "$APP_NAME"
+printf '  Hyprland <= 0.54, hyprlang config (~/.config/hypr/hyprland.conf):\n'
+printf '    bind = CTRL SHIFT, S, exec, "%s/%s" --capture\n' "$BIN_DIR" "$APP_NAME"
 printf 'Remove conflicting bindings, then run: hyprctl reload\n'
+printf 'Note: if hyprland.lua exists, Hyprland ignores hyprland.conf entirely.\n'
 printf 'Test directly: "%s/%s" --capture\n' "$BIN_DIR" "$APP_NAME"
 printf 'Screenshots: ~/Pictures/MintShot/\n'
 printf 'Uninstall: ./uninstall.sh (screenshots are preserved)\n'
